@@ -1,0 +1,98 @@
+[project]
+name = "alkebulan-agent"
+version = "1.0.0"
+description = "AI-powered DeFi trading agent for MoleApp - Hyperliquid perpetuals via RAG + DeepSeek"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "MoleApp Team" }
+]
+
+dependencies = [
+    # FastAPI & Server
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+
+    # AI/ML - LangGraph & RAG
+    "langgraph>=0.2.0",
+    "langchain>=0.3.0",
+    "langchain-community>=0.3.0",
+    "faiss-cpu>=1.7.4",
+    "sentence-transformers>=2.2.2",
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+
+    # Hyperliquid & Trading
+    "hyperliquid-python-sdk>=0.8.0",
+    "ccxt>=4.0.0",
+    "eth-account>=0.10.0",
+    "msgpack>=1.0.0",
+
+    # Database
+    "sqlalchemy>=2.0.25",
+    "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
+
+    # HTTP Client
+    "httpx>=0.26.0",
+    "aiohttp>=3.9.0",
+
+    # Task Scheduling & Job Queue
+    "apscheduler>=3.10.0",
+    "arq>=0.26.0",
+    "redis[hiredis]>=5.0.0",
+
+    # Rate Limiting & WebSocket
+    "aiolimiter>=1.1.0",
+    "websockets>=12.0",
+
+    # HCP Vault (Transit Engine for Master EOA keys)
+    "hvac>=2.1.0",
+
+    # Observability
+    "langfuse>=2.0.0",
+
+    # Utilities
+    "python-jose[cryptography]>=3.3.0",
+    "structlog>=24.1.0",
+    "prometheus-client>=0.19.0",
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+    "httpx>=0.26.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

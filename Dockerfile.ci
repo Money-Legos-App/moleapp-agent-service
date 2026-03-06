@@ -1,0 +1,71 @@
+# CI/CD multi-stage build for agent-service
+# Based on existing single-stage Dockerfile but with:
+#   - Multi-stage (build-essential only in builder, ~200MB savings)
+#   - Non-root user
+#   - Isolated venv for clean copy
+# Context: backend/
+
+# === Builder ===
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Build-time deps for native compilation (faiss-cpu, cryptography, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install UV package manager for faster dependency resolution
+RUN pip install --no-cache-dir uv
+
+# Copy dependency files first for better caching
+COPY agent-service/pyproject.toml ./
+COPY agent-service/README.md ./
+
+# Install into isolated venv (cleanly copyable to production)
+RUN uv venv /opt/venv \
+ && . /opt/venv/bin/activate \
+ && uv pip install -e . --no-cache
+
+# === Production ===
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Runtime-only: wget for healthcheck, libgomp1 for faiss-cpu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    libgomp1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && addgroup --gid 1001 --system appgroup \
+ && adduser --system --uid 1001 --ingroup appgroup appuser
+
+# Copy pre-built virtualenv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
+# Copy application code
+COPY agent-service/app ./app
+COPY agent-service/data_pipeline ./data_pipeline
+
+# Create data directories
+RUN mkdir -p /app/data/faiss_index /app/data/raw \
+ && chown -R appuser:appgroup /app
+
+USER appuser
+
+# Set Python path
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Expose port
+EXPOSE 3006
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD wget -q -O - http://localhost:${PORT:-3006}/health || exit 1
+
+# Run the application
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-3006}"]
