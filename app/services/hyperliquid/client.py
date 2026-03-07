@@ -303,11 +303,20 @@ class HyperliquidClient:
         coin_index = {u["name"]: i for i, u in enumerate(universe)}
         self._asset_index_cache = coin_index
 
-        # 2) Fetch L2 books concurrently for all requested assets
+        # Filter to only assets that exist in the HL universe
+        valid_assets = []
+        for asset in assets:
+            coin = asset.replace("-USD", "")
+            if coin in coin_index:
+                valid_assets.append(asset)
+            else:
+                logger.warning("Asset not found in Hyperliquid universe, skipping", asset=asset)
+
+        # 2) Fetch L2 books concurrently for valid assets only
         async def _get_l2(coin: str):
             return coin, await self._info_request("l2Book", {"coin": coin})
 
-        coins = [a.replace("-USD", "") for a in assets]
+        coins = [a.replace("-USD", "") for a in valid_assets]
         l2_results = await asyncio.gather(
             *[_get_l2(c) for c in coins],
             return_exceptions=True,
@@ -319,15 +328,12 @@ class HyperliquidClient:
 
         # 3) Assemble per-asset data
         results: Dict[str, Dict[str, Any]] = {}
-        for asset in assets:
+        for asset in valid_assets:
             coin = asset.replace("-USD", "")
             idx = coin_index.get(coin)
 
             asset_info = universe[idx] if idx is not None and idx < len(universe) else None
             asset_ctx = asset_ctxs[idx] if idx is not None and idx < len(asset_ctxs) else None
-
-            if not asset_info:
-                logger.warning("Asset not found in Hyperliquid universe", asset=asset)
 
             if asset_ctx:
                 mark_price = float(asset_ctx.get("markPx", 0))

@@ -77,7 +77,7 @@ CORRELATION_BUCKETS = {
     "AVAX-USD": "uncorrelated",
     "SUI-USD": "uncorrelated",
     "WIF-USD": "uncorrelated",
-    "PEPE-USD": "uncorrelated",
+    "kPEPE-USD": "uncorrelated",
 }
 
 # Default caps (overridden by settings at runtime)
@@ -161,7 +161,7 @@ MAINTENANCE_MARGIN_RATIOS = {
     "AVAX-USD": 0.05,
     "SUI-USD": 0.05,
     "WIF-USD": 0.10,
-    "PEPE-USD": 0.10,
+    "kPEPE-USD": 0.10,
 }
 DEFAULT_MAINTENANCE_MARGIN = 0.05
 
