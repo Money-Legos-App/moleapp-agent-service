@@ -427,6 +427,7 @@ class ExecutionWorkerPool:
                         "asset": p["asset"],
                         "direction": p["direction"],
                         "leverage": p.get("leverage", 1),
+                        "margin_used": p.get("margin_used", 0),
                         "unrealized_pnl": (
                             (p["unrealized_pnl"] / p.get("margin_used", 1) * 100)
                             if p.get("margin_used")
@@ -459,6 +460,16 @@ class ExecutionWorkerPool:
 
                 orders_executed = 0
                 orders_failed = 0
+
+                # Block new entries if risk monitor is unhealthy
+                if settings.heartbeat_block_new_entries:
+                    monitor_unhealthy = await self._redis.get("agent:risk:monitor_unhealthy")
+                    if monitor_unhealthy:
+                        logger.warning(
+                            "Risk monitor unhealthy, blocking new entries",
+                            mission_id=mission_id,
+                        )
+                        return {"success": True, "skipped": True, "reason": "risk_monitor_unhealthy"}
 
                 for signal in market_state.signals:
                     asset = signal["asset"]
@@ -526,14 +537,51 @@ class ExecutionWorkerPool:
                         continue
 
                     position_size = (position_margin * adjusted_leverage) / market_price
+
+                    # Slippage-aware sizing: reduce in stressed markets
+                    if settings.slippage_sizing_enabled and position_size > 0:
+                        from app.services.risk_manager import calculate_slippage_adjusted_size
+                        coin = asset.replace("-USD", "")
+                        redis_coin_raw = await self._redis.hget("agent:market:prices", coin)
+                        slippage_price_data = {}
+                        if redis_coin_raw:
+                            try:
+                                slippage_price_data = json.loads(redis_coin_raw)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        position_size, slippage_reduction = calculate_slippage_adjusted_size(
+                            base_position_size=position_size,
+                            market_price=market_price,
+                            cached_price_data=slippage_price_data,
+                            max_slippage_reduction_pct=settings.slippage_max_reduction_pct,
+                        )
+                        if slippage_reduction > 0:
+                            logger.info(
+                                "Position size reduced for slippage",
+                                mission_id=mission_id,
+                                asset=asset,
+                                reduction_pct=slippage_reduction,
+                            )
+
                     if position_size <= 0:
                         continue
 
-                    # Calculate SL/TP from user's risk profile
-                    from app.services.risk_manager import get_risk_profile
+                    # Calculate SL/TP from user's risk profile (with dynamic SL scaling)
+                    from app.services.risk_manager import get_risk_profile, calculate_dynamic_stop_loss_pct
                     risk_profile = get_risk_profile(mission_context.get("risk_level", "MODERATE"))
-                    sl_pct = risk_profile["stop_loss_pct"]
                     tp_pct = risk_profile["take_profit_pct"]
+
+                    # Dynamic SL: at high leverage, tightens SL to stay ahead of liquidation
+                    if settings.dynamic_sl_enabled:
+                        sl_pct = calculate_dynamic_stop_loss_pct(
+                            asset=asset,
+                            leverage=adjusted_leverage,
+                            profile_sl_pct=risk_profile["stop_loss_pct"],
+                            liquidation_buffer_pct=settings.dynamic_sl_buffer_pct,
+                        )
+                    else:
+                        sl_pct = risk_profile["stop_loss_pct"]
+
                     if signal["direction"] == "LONG":
                         stop_loss = market_price * (1 - sl_pct / 100)
                         take_profit = market_price * (1 + tp_pct / 100)
@@ -718,6 +766,28 @@ class ExecutionWorkerPool:
         total_pnl_percent = mission_context.get("total_pnl_percent", 0)
         if total_pnl_percent < -15 and signal.get("confidence") != "HIGH":
             return "drawdown_guard"
+
+        # 7) Correlation bucket: reject if adding this asset exceeds bucket cap
+        from app.config import get_settings as _get_settings
+        _settings = _get_settings()
+        if _settings.correlation_bucketing_enabled:
+            from app.services.risk_manager import check_correlation_bucket_exceeded
+            bucket_caps = {
+                "btc_correlated": _settings.correlation_bucket_btc_cap,
+                "eth_correlated": _settings.correlation_bucket_eth_cap,
+                "uncorrelated": _settings.correlation_bucket_uncorrelated_cap,
+            }
+            exceeded, reason = check_correlation_bucket_exceeded(
+                new_asset=signal["asset"],
+                new_leverage=signal.get("recommended_leverage", 1),
+                new_margin=account.get("withdrawable", 0) * 0.1,  # estimate 10% allocation
+                existing_positions=existing_positions,
+                account_value=account.get("account_value", 0),
+                max_mission_leverage=mission_context.get("max_leverage", 2),
+                bucket_caps=bucket_caps,
+            )
+            if exceeded:
+                return reason
 
         return None
 

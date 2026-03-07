@@ -4,9 +4,14 @@ Position Monitoring Tasks
 Two-phase monitoring that runs every 5 minutes:
   Phase A: Risk Enforcement — deterministic SL/TP/trailing/drawdown closes
   Phase B: Informational Alerts — liquidation warnings, large loss alerts
+
+Infrastructure Resilience:
+  - Primary monitor writes heartbeat to Redis each cycle
+  - Backup monitor (60s) checks heartbeat and takes over if missing
 """
 
 import json
+import time
 from typing import List, Dict, Any
 
 import structlog
@@ -14,6 +19,9 @@ import structlog
 from app.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+HEARTBEAT_KEY = "agent:risk:heartbeat"
+MONITOR_UNHEALTHY_KEY = "agent:risk:monitor_unhealthy"
 
 
 async def check_positions_for_alerts() -> List[Dict[str, Any]]:
@@ -44,6 +52,14 @@ async def check_positions_for_alerts() -> List[Dict[str, Any]]:
     try:
         # Read cached prices from Redis for mark price reference
         redis = await get_redis()
+
+        # Write heartbeat: "primary risk monitor is alive"
+        await redis.set(
+            HEARTBEAT_KEY,
+            json.dumps({"ts": time.time(), "source": "primary"}),
+            ex=settings.heartbeat_ttl_seconds,
+        )
+
         cached_prices = {}
         raw_prices = await redis.hgetall("agent:market:prices")
         for coin, data_str in raw_prices.items():
@@ -195,6 +211,13 @@ async def check_positions_for_alerts() -> List[Dict[str, Any]]:
     if alerts:
         await _send_alert_notifications(alerts)
 
+    # Clear unhealthy flag: primary completed successfully
+    try:
+        redis = await get_redis()
+        await redis.delete(MONITOR_UNHEALTHY_KEY)
+    except Exception:
+        pass
+
     return alerts
 
 
@@ -219,3 +242,47 @@ async def _send_alert_notifications(alerts: List[Dict[str, Any]]) -> None:
                 mission_id=alert["mission_id"],
                 message=alert.get("message"),
             )
+
+
+async def backup_risk_monitor() -> Dict[str, Any]:
+    """
+    Dead-man's-switch backup monitor.
+
+    Runs every 60 seconds via scheduler. If primary heartbeat is missing
+    (TTL expired), takes over risk evaluation to prevent positions from
+    going unmonitored during agent service issues.
+
+    Also sets a Redis flag that blocks new position entries when the
+    primary monitor is unhealthy.
+    """
+    from app.services.execution_queue import get_redis
+
+    redis = await get_redis()
+    settings = get_settings()
+
+    heartbeat_raw = await redis.get(HEARTBEAT_KEY)
+
+    if heartbeat_raw:
+        # Primary is alive — nothing to do
+        return {"status": "primary_healthy", "action": "none"}
+
+    # Heartbeat missing — primary may be down
+    logger.warning("BACKUP MONITOR: Primary heartbeat missing, taking over risk checks")
+
+    # Set unhealthy flag (checked by execution pre-filter to block new entries)
+    await redis.set(MONITOR_UNHEALTHY_KEY, "1", ex=settings.heartbeat_ttl_seconds)
+
+    if not settings.risk_enforcement_enabled:
+        return {"status": "primary_down", "action": "risk_enforcement_disabled"}
+
+    # Run the same risk evaluation as the primary
+    try:
+        alerts = await check_positions_for_alerts()
+        return {
+            "status": "primary_down",
+            "action": "backup_executed",
+            "alerts": len(alerts),
+        }
+    except Exception as e:
+        logger.error("Backup monitor risk check failed", error=str(e))
+        return {"status": "primary_down", "action": "backup_failed", "error": str(e)}

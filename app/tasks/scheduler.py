@@ -97,6 +97,16 @@ class AgentScheduler:
             replace_existing=True,
         )
 
+        # Backup Risk Monitor (dead-man's-switch heartbeat check)
+        self._scheduler.add_job(
+            self._run_backup_risk_monitor,
+            trigger=IntervalTrigger(seconds=60),
+            id="backup_risk_monitor",
+            name="Backup Risk Monitor (Heartbeat Check)",
+            max_instances=1,
+            replace_existing=True,
+        )
+
         # Deposit checks are event-driven (enqueued on mission activation via arq)
         # — no cron polling needed
 
@@ -266,6 +276,26 @@ class AgentScheduler:
 
         except Exception as e:
             logger.error("Mission expiry check failed", error=str(e))
+
+    async def _run_backup_risk_monitor(self) -> None:
+        """
+        Dead-man's-switch: check heartbeat and run backup risk evaluation
+        if primary monitor is unresponsive.
+        """
+        try:
+            from app.tasks.monitoring import backup_risk_monitor
+
+            result = await backup_risk_monitor()
+
+            if result.get("action") != "none":
+                logger.warning(
+                    "Backup risk monitor activated",
+                    status=result.get("status"),
+                    action=result.get("action"),
+                )
+
+        except Exception as e:
+            logger.error("Backup risk monitor failed", error=str(e))
 
     def get_job_status(self) -> dict:
         """Get status of all scheduled jobs."""

@@ -60,6 +60,217 @@ def get_risk_profile(risk_level: str) -> dict:
 
 
 # ==================
+# Correlation Bucketing
+# ==================
+
+# Maps each tradeable asset to its correlation bucket
+CORRELATION_BUCKETS = {
+    "BTC-USD": "btc_correlated",
+    "ETH-USD": "eth_correlated",
+    "ARB-USD": "eth_correlated",
+    "OP-USD": "eth_correlated",
+    "SOL-USD": "uncorrelated",
+    "XRP-USD": "uncorrelated",
+    "ADA-USD": "uncorrelated",
+}
+
+# Default caps (overridden by settings at runtime)
+BUCKET_CAPS = {
+    "btc_correlated": 50.0,
+    "eth_correlated": 35.0,
+    "uncorrelated": 15.0,
+}
+
+
+def check_correlation_bucket_exceeded(
+    new_asset: str,
+    new_leverage: float,
+    new_margin: float,
+    existing_positions: List[Dict[str, Any]],
+    account_value: float,
+    max_mission_leverage: float,
+    bucket_caps: Optional[Dict[str, float]] = None,
+) -> Tuple[bool, str]:
+    """
+    Check if adding a new position would exceed the bucket's leverage cap.
+
+    Args:
+        new_asset: Asset to add (e.g., "ETH-USD")
+        new_leverage: Leverage for the new position
+        new_margin: Margin allocated to the new position
+        existing_positions: List of dicts with {asset, leverage, margin_used}
+        account_value: Total account equity
+        max_mission_leverage: Mission's max leverage setting
+        bucket_caps: Override caps per bucket (default: BUCKET_CAPS)
+
+    Returns:
+        (exceeded, reason_string)
+    """
+    if account_value <= 0:
+        return False, ""
+
+    caps = bucket_caps or BUCKET_CAPS
+    target_bucket = CORRELATION_BUCKETS.get(new_asset, "uncorrelated")
+    cap_pct = caps.get(target_bucket, 100.0)
+
+    # Total leverage budget = account_value * max_mission_leverage
+    total_budget = account_value * max_mission_leverage
+    if total_budget <= 0:
+        return False, ""
+
+    # Sum notional exposure in the target bucket from existing positions
+    bucket_exposure = 0.0
+    for pos in existing_positions:
+        pos_bucket = CORRELATION_BUCKETS.get(pos.get("asset", ""), "uncorrelated")
+        if pos_bucket == target_bucket:
+            pos_leverage = pos.get("leverage", 1)
+            pos_margin = pos.get("margin_used", 0)
+            bucket_exposure += pos_leverage * pos_margin
+
+    # Add proposed position
+    proposed_total = bucket_exposure + (new_leverage * new_margin)
+    bucket_pct = (proposed_total / total_budget) * 100
+
+    if bucket_pct > cap_pct:
+        return True, f"bucket_{target_bucket}_exceeded"
+
+    return False, ""
+
+
+# ==================
+# Dynamic Stop-Loss Scaling
+# ==================
+
+# Approximate maintenance margin ratios for Hyperliquid assets
+MAINTENANCE_MARGIN_RATIOS = {
+    "BTC-USD": 0.0333,
+    "ETH-USD": 0.0333,
+    "SOL-USD": 0.05,
+    "ARB-USD": 0.05,
+    "OP-USD": 0.05,
+    "XRP-USD": 0.05,
+    "ADA-USD": 0.05,
+}
+DEFAULT_MAINTENANCE_MARGIN = 0.05
+
+
+def calculate_dynamic_stop_loss_pct(
+    asset: str,
+    leverage: float,
+    profile_sl_pct: float,
+    liquidation_buffer_pct: float = 20.0,
+) -> float:
+    """
+    Calculate leverage-aware stop loss percentage.
+
+    The key insight: the stop-loss percentage must ALWAYS be smaller than the
+    distance from entry to liquidation. At high leverage, liquidation is very
+    close to entry, so the SL must be tighter than the profile default.
+
+    Logic:
+    - Calculate the max safe SL% (distance to liquidation minus buffer)
+    - Use min(profile_sl, max_safe_sl) to ensure SL never lands behind liquidation
+    - At low leverage (1-3x), max_safe_sl is very large (33%+), so profile wins
+    - At high leverage (10x+), max_safe_sl shrinks, forcing tighter stops
+
+    Args:
+        asset: Trading pair (e.g., "ETH-USD")
+        leverage: Actual leverage used
+        profile_sl_pct: Base SL% from risk profile (e.g., 5.0)
+        liquidation_buffer_pct: Extra buffer kept between SL and liquidation (default 20%)
+
+    Returns:
+        SL percentage to use
+    """
+    if leverage <= 0:
+        return profile_sl_pct
+
+    mmr = MAINTENANCE_MARGIN_RATIOS.get(asset, DEFAULT_MAINTENANCE_MARGIN)
+
+    # Distance from entry to liquidation as percentage ≈ (1/leverage - mmr) * 100
+    # Simplified: for isolated margin, liq distance ≈ (1 - mmr * leverage) / leverage
+    # More conservative approximation that works across margin modes:
+    liq_distance_pct = (1.0 / leverage) * 100  # e.g., 10x → 10%, 2x → 50%
+
+    # Max safe SL = liquidation distance minus a buffer (so SL triggers before liq)
+    # Buffer is a percentage OF the liquidation distance
+    buffer_amount = liq_distance_pct * (liquidation_buffer_pct / 100)
+    max_safe_sl_pct = liq_distance_pct - buffer_amount
+
+    if max_safe_sl_pct <= 0:
+        # Extremely high leverage — force minimum viable SL
+        return 0.5
+
+    # Use the SMALLER of profile SL and max safe SL
+    # At low leverage: max_safe_sl is huge (40%+), so profile_sl wins → normal behavior
+    # At high leverage: max_safe_sl shrinks, forcing tighter stops → safety kicks in
+    return min(profile_sl_pct, max_safe_sl_pct)
+
+
+# ==================
+# Slippage-Aware Position Sizing
+# ==================
+
+def calculate_slippage_adjusted_size(
+    base_position_size: float,
+    market_price: float,
+    cached_price_data: Dict[str, Any],
+    max_slippage_reduction_pct: float = 30.0,
+) -> Tuple[float, float]:
+    """
+    Reduce position size based on market stress indicators.
+
+    Stress signals (from Redis-cached market data):
+    - High absolute funding rate (crowded trade, potential cascade)
+    - Mark price deviation from expected price (fast-moving market)
+
+    Args:
+        base_position_size: Original calculated position size
+        market_price: Current market price used for the order
+        cached_price_data: Redis cached data {markPx, funding, volume, OI}
+        max_slippage_reduction_pct: Maximum reduction (default 30%)
+
+    Returns:
+        (adjusted_size, reduction_pct)
+    """
+    if not cached_price_data or base_position_size <= 0:
+        return base_position_size, 0.0
+
+    stress_score = 0.0  # 0.0 to 1.0
+
+    # Factor 1: Funding rate stress (crowded trade indicator)
+    try:
+        funding = abs(float(cached_price_data.get("funding", 0)))
+    except (ValueError, TypeError):
+        funding = 0.0
+
+    if funding > 0.0003:       # > 0.03% per 8h ≈ very stressed
+        stress_score += 0.4
+    elif funding > 0.0001:     # > 0.01% per 8h ≈ moderately stressed
+        stress_score += 0.2
+
+    # Factor 2: Mark price deviation from our order price
+    try:
+        mark_px = float(cached_price_data.get("markPx", 0))
+    except (ValueError, TypeError):
+        mark_px = 0.0
+
+    if mark_px > 0 and market_price > 0:
+        deviation_pct = abs(market_price - mark_px) / mark_px * 100
+        if deviation_pct > 0.5:
+            stress_score += 0.3
+        elif deviation_pct > 0.2:
+            stress_score += 0.15
+
+    stress_score = min(stress_score, 1.0)
+
+    reduction_pct = stress_score * max_slippage_reduction_pct
+    adjusted_size = base_position_size * (1 - reduction_pct / 100)
+
+    return max(adjusted_size, 0.0), round(reduction_pct, 2)
+
+
+# ==================
 # Risk Action
 # ==================
 

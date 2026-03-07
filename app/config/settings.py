@@ -356,6 +356,65 @@ class Settings(BaseSettings):
         description="Close positions when within this % of liquidation price",
     )
 
+    # Dynamic Stop-Loss Scaling
+    dynamic_sl_enabled: bool = Field(
+        default=True,
+        alias="DYNAMIC_SL_ENABLED",
+        description="Enable leverage-aware dynamic stop-loss calculation",
+    )
+    dynamic_sl_buffer_pct: float = Field(
+        default=20.0,
+        alias="DYNAMIC_SL_BUFFER_PCT",
+        description="Liquidation buffer % for dynamic SL (higher = wider SL). "
+        "At 1-3x leverage, profile SL wins; dynamic SL is a safety net for higher leverage.",
+    )
+
+    # Slippage-Aware Position Sizing
+    slippage_sizing_enabled: bool = Field(
+        default=True,
+        alias="SLIPPAGE_SIZING_ENABLED",
+        description="Enable market-stress-based position size reduction",
+    )
+    slippage_max_reduction_pct: float = Field(
+        default=30.0,
+        alias="SLIPPAGE_MAX_REDUCTION_PCT",
+        description="Maximum position size reduction under market stress (%)",
+    )
+
+    # Correlation Bucketing
+    correlation_bucketing_enabled: bool = Field(
+        default=True,
+        alias="CORRELATION_BUCKETING_ENABLED",
+        description="Enable beta-bucket exposure caps to prevent correlated concentration",
+    )
+    correlation_bucket_btc_cap: float = Field(
+        default=50.0,
+        alias="CORRELATION_BUCKET_BTC_CAP",
+        description="Max % of total leverage budget for BTC-correlated assets",
+    )
+    correlation_bucket_eth_cap: float = Field(
+        default=35.0,
+        alias="CORRELATION_BUCKET_ETH_CAP",
+        description="Max % of total leverage budget for ETH-correlated assets",
+    )
+    correlation_bucket_uncorrelated_cap: float = Field(
+        default=15.0,
+        alias="CORRELATION_BUCKET_UNCORRELATED_CAP",
+        description="Max % of total leverage budget for uncorrelated assets",
+    )
+
+    # Infrastructure Resilience (Heartbeat + Backup Monitor)
+    heartbeat_ttl_seconds: int = Field(
+        default=600,
+        alias="HEARTBEAT_TTL_SECONDS",
+        description="Risk monitor heartbeat TTL (should be > 2x monitoring interval)",
+    )
+    heartbeat_block_new_entries: bool = Field(
+        default=True,
+        alias="HEARTBEAT_BLOCK_NEW_ENTRIES",
+        description="Block new position entries when risk monitor heartbeat is missing",
+    )
+
     # Circuit Breaker
     circuit_breaker_failure_threshold: int = Field(
         default=5,
