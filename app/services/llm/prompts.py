@@ -190,6 +190,7 @@ Respond with:
 - Entry Price: ${entry_price:,.2f}
 - Current Price: ${current_price:,.2f}
 - Unrealized PnL: {unrealized_pnl:+.2f}%
+- Peak Unrealized PnL: {peak_pnl:+.2f}% (highest profit reached during this trade)
 - Position Size: ${position_value:,.2f}
 - Leverage: {leverage}x
 - Time in Position: {hours_in_position} hours
@@ -422,6 +423,7 @@ Respond with:
             entry_price=position.get("entry_price", 0),
             current_price=position.get("current_price", 0),
             unrealized_pnl=position.get("unrealized_pnl_percent", 0),
+            peak_pnl=position.get("peak_pnl_percent", 0),
             position_value=position.get("position_value", 0),
             leverage=position.get("leverage", 1),
             hours_in_position=position.get("hours_in_position", 0),

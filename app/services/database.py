@@ -1149,6 +1149,41 @@ async def get_open_positions(mission_id: str) -> List[Dict[str, Any]]:
         ]
 
 
+async def get_all_open_positions_with_risk() -> List[Dict[str, Any]]:
+    """
+    Get ALL open positions across all missions with SL/TP/liquidation data.
+    Used by the fast risk scanner (60s interval, zero API calls).
+    """
+    async with get_db() as db:
+        query = text("""
+            SELECT
+                id, "missionId", asset, direction,
+                "entryPrice", quantity, leverage,
+                "stopLossPrice", "takeProfitPrice", "liquidationPrice"
+            FROM agent_positions
+            WHERE status = 'OPEN'
+        """)
+
+        result = await db.execute(query)
+        rows = result.fetchall()
+
+        return [
+            {
+                "id": row.id,
+                "mission_id": row.missionId,
+                "asset": row.asset,
+                "direction": row.direction,
+                "entry_price": float(row.entryPrice),
+                "quantity": float(row.quantity),
+                "leverage": row.leverage,
+                "stop_loss_price": float(row.stopLossPrice) if row.stopLossPrice else None,
+                "take_profit_price": float(row.takeProfitPrice) if row.takeProfitPrice else None,
+                "liquidation_price": float(row.liquidationPrice) if row.liquidationPrice else None,
+            }
+            for row in rows
+        ]
+
+
 # ==================
 # User-Facing Query Functions (Phase 4)
 # ==================

@@ -513,13 +513,39 @@ async def _wait_for_settlement(
             )
             return settled_amount
 
-    logger.error(
-        "Bridge settlement timeout",
+    logger.critical(
+        "SETTLEMENT TIMEOUT — funds may be in transit, key preserved for manual recovery",
         mission_id=mission_id,
         elapsed_seconds=elapsed,
         polls=polls,
         last_balance=current_balance if polls > 0 else initial_balance,
+        expected_atomic=expected_atomic,
     )
+
+    # Record settlement timeout in DB for ops visibility
+    try:
+        from app.services.database import record_agent_audit
+        await record_agent_audit(
+            node="lifecycle",
+            action="settlement_timeout",
+            mission_id=mission_id,
+            error_message=(
+                f"HL bridge withdrawal did not settle within {SETTLEMENT_MAX_WAIT}s. "
+                f"Expected ~{float(expected_amount):.2f} USDC. "
+                f"Last Arbitrum balance: {(current_balance if polls > 0 else initial_balance) / 1e6:.2f} USDC. "
+                f"Encrypted key preserved. Requires manual intervention."
+            ),
+            metadata={
+                "elapsed_seconds": elapsed,
+                "polls": polls,
+                "expected_usdc": float(expected_amount),
+                "master_eoa": master_eoa_address,
+            },
+            success=False,
+        )
+    except Exception:
+        pass
+
     return None
 
 

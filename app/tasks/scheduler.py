@@ -107,6 +107,16 @@ class AgentScheduler:
             replace_existing=True,
         )
 
+        # Fast Risk Scanner (SL/TP check using cached Redis prices, no API calls)
+        self._scheduler.add_job(
+            self._run_fast_risk_scan,
+            trigger=IntervalTrigger(seconds=60),
+            id="fast_risk_scan",
+            name="Fast Risk Scanner (Cached Prices)",
+            max_instances=1,
+            replace_existing=True,
+        )
+
         # Stuck Mission Recovery (retry missions stuck in COMPLETING for >30 min)
         self._scheduler.add_job(
             self._run_stuck_mission_recovery,
@@ -306,6 +316,29 @@ class AgentScheduler:
 
         except Exception as e:
             logger.error("Backup risk monitor failed", error=str(e))
+
+    async def _run_fast_risk_scan(self) -> None:
+        """
+        Fast SL/TP/liquidation scanner using cached Redis prices.
+
+        Runs every 60s, zero API calls — closes the 5-minute gap between
+        full position monitoring cycles. Only triggers on positions where
+        cached mark price has crossed SL/TP/liquidation thresholds.
+        """
+        try:
+            from app.tasks.monitoring import fast_risk_scan
+
+            result = await fast_risk_scan()
+
+            if result.get("actions", 0) > 0:
+                logger.warning(
+                    "Fast risk scan triggered closes",
+                    checked=result["checked"],
+                    actions=result["actions"],
+                )
+
+        except Exception as e:
+            logger.error("Fast risk scan failed", error=str(e))
 
     async def _run_stuck_mission_recovery(self) -> None:
         """

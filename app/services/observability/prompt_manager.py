@@ -400,6 +400,7 @@ class PromptManager:
         entry_price = position.get("entry_price", 0)
         current_price = position.get("current_price", 0)
         unrealized_pnl = position.get("unrealized_pnl_percent", 0)
+        peak_pnl = position.get("peak_pnl_percent", 0)
         position_value = position.get("position_value", 0)
         total_pnl = mission.get("total_pnl_percent", 0)
         price_change_24h = market_data.get("price_change_24h", 0)
@@ -416,6 +417,7 @@ class PromptManager:
             "entry_price": f"{entry_price:,.2f}",
             "current_price": f"{current_price:,.2f}",
             "unrealized_pnl": f"{unrealized_pnl:+.2f}",
+            "peak_pnl": f"{peak_pnl:+.2f}",
             "position_value": f"{position_value:,.2f}",
             "funding_rate_hourly": f"{funding_rate_hourly:.4f}",
             "funding_rate_apr": f"{funding_rate_apr:.1f}",

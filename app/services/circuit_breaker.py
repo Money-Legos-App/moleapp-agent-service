@@ -133,7 +133,33 @@ class ExecutionCircuitBreaker:
             pipe.hdel(CB_TRIPPED_KEY, mission_id)
             pipe.delete(self._failures_key(mission_id))
             await pipe.execute()
-            logger.info("Circuit breaker auto-reset", mission_id=mission_id)
+
+            tripped_duration_min = (now - trip_time) / 60
+            logger.warning(
+                "CIRCUIT BREAKER AUTO-RESET — trading resumed for mission",
+                mission_id=mission_id,
+                was_tripped_for_minutes=round(tripped_duration_min, 1),
+                tripped_at=trip_time,
+                reset_at=now,
+            )
+
+            # Record auto-reset in DB for ops visibility
+            try:
+                from app.services.database import record_agent_audit
+                import asyncio
+                asyncio.ensure_future(record_agent_audit(
+                    node="risk",
+                    action="circuit_breaker_auto_reset",
+                    mission_id=mission_id,
+                    metadata={
+                        "tripped_duration_minutes": round(tripped_duration_min, 1),
+                        "reset_seconds_config": self.reset_seconds,
+                    },
+                    success=True,
+                ))
+            except Exception:
+                pass
+
             return False
 
         return True

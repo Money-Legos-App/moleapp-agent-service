@@ -244,6 +244,144 @@ async def _send_alert_notifications(alerts: List[Dict[str, Any]]) -> None:
             )
 
 
+async def fast_risk_scan() -> Dict[str, Any]:
+    """
+    Lightweight SL/TP scanner using ONLY Redis-cached prices.
+
+    Runs every 60 seconds between the full 5-minute position monitoring cycles.
+    Zero API calls — reads cached mark prices from the 60s market data refresh
+    and DB positions with SL/TP levels.
+
+    This closes the 5-minute gap where positions go unmonitored.
+    """
+    from app.services.execution_queue import get_redis
+    from app.services.database import get_all_open_positions_with_risk
+    from app.services.risk_manager import (
+        check_stop_loss, check_take_profit, check_liquidation_proximity,
+        get_risk_profile, RiskAction,
+    )
+
+    settings = get_settings()
+
+    if not settings.risk_enforcement_enabled:
+        return {"status": "disabled", "checked": 0, "actions": 0}
+
+    redis = await get_redis()
+
+    # Load cached mark prices (refreshed every 60s by market_data_worker)
+    cached_prices = {}
+    raw_prices = await redis.hgetall("agent:market:prices")
+    for coin, data_str in raw_prices.items():
+        try:
+            cached_prices[coin] = json.loads(data_str)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if not cached_prices:
+        return {"status": "no_cached_prices", "checked": 0, "actions": 0}
+
+    # Load all open positions with SL/TP from DB (single query, no API calls)
+    try:
+        positions = await get_all_open_positions_with_risk()
+    except Exception as e:
+        logger.warning("Fast risk scan: failed to load positions", error=str(e))
+        return {"status": "db_error", "checked": 0, "actions": 0}
+
+    if not positions:
+        return {"status": "ok", "checked": 0, "actions": 0}
+
+    actions: List[RiskAction] = []
+    checked = 0
+
+    for pos in positions:
+        asset = pos.get("asset", "")
+        coin = asset.replace("-USD", "")
+        direction = pos.get("direction", "")
+
+        if coin not in cached_prices:
+            continue
+
+        current_price = cached_prices[coin].get("markPx", 0)
+        if current_price <= 0:
+            continue
+
+        checked += 1
+        sl_price = pos.get("stop_loss_price", 0) or 0
+        tp_price = pos.get("take_profit_price", 0) or 0
+        liq_price = pos.get("liquidation_price", 0) or 0
+        position_id = pos.get("id", "")
+        mission_id = pos.get("mission_id", "")
+
+        # Check liquidation proximity (highest priority)
+        liq_buffer = settings.risk_liquidation_protection_percent
+        if liq_price > 0 and check_liquidation_proximity(direction, current_price, liq_price, liq_buffer):
+            actions.append(RiskAction(
+                position_id=position_id, mission_id=mission_id,
+                asset=asset, direction=direction, size=abs(pos.get("quantity", 0)),
+                reason="LIQUIDATION_PROTECTION",
+                current_price=current_price, trigger_price=liq_price,
+            ))
+            continue
+
+        # Check stop loss
+        if sl_price > 0 and check_stop_loss(direction, current_price, sl_price):
+            actions.append(RiskAction(
+                position_id=position_id, mission_id=mission_id,
+                asset=asset, direction=direction, size=abs(pos.get("quantity", 0)),
+                reason="STOP_LOSS",
+                current_price=current_price, trigger_price=sl_price,
+            ))
+            continue
+
+        # Check take profit
+        if tp_price > 0 and check_take_profit(direction, current_price, tp_price):
+            actions.append(RiskAction(
+                position_id=position_id, mission_id=mission_id,
+                asset=asset, direction=direction, size=abs(pos.get("quantity", 0)),
+                reason="TAKE_PROFIT",
+                current_price=current_price, trigger_price=tp_price,
+            ))
+
+    if actions:
+        logger.warning(
+            "FAST RISK SCAN: triggers detected",
+            actions_count=len(actions),
+            details=[
+                {"asset": a.asset, "reason": a.reason, "price": a.current_price}
+                for a in actions
+            ],
+        )
+
+        # Execute the closes
+        from app.services.hyperliquid import HyperliquidClient
+        from app.services.wallet import TurnkeyBridge
+        from app.services.risk_manager import execute_risk_closes
+
+        hl_client = HyperliquidClient()
+        wallet_bridge = TurnkeyBridge()
+
+        try:
+            # Group actions by mission for execute_risk_closes
+            missions_map: Dict[str, Dict] = {}
+            for a in actions:
+                if a.mission_id not in missions_map:
+                    missions_map[a.mission_id] = {"id": a.mission_id}
+
+            for mission_id, mission in missions_map.items():
+                mission_actions = [a for a in actions if a.mission_id == mission_id]
+                await execute_risk_closes(
+                    actions=mission_actions,
+                    mission=mission,
+                    hl_client=hl_client,
+                    wallet_bridge=wallet_bridge,
+                )
+        finally:
+            await hl_client.close()
+            await wallet_bridge.close()
+
+    return {"status": "ok", "checked": checked, "actions": len(actions)}
+
+
 async def backup_risk_monitor() -> Dict[str, Any]:
     """
     Dead-man's-switch backup monitor.

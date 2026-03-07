@@ -418,6 +418,7 @@ async def get_trailing_state(redis, position_id: str) -> Optional[Dict[str, floa
     return {
         "highest_price": float(data.get("highest_price", 0)),
         "lowest_price": float(data.get("lowest_price", 0)),
+        "peak_pnl_percent": float(data.get("peak_pnl_percent", 0)),
     }
 
 
@@ -426,13 +427,15 @@ async def set_trailing_state(
     position_id: str,
     highest_price: float,
     lowest_price: float,
+    peak_pnl_percent: float = 0.0,
 ) -> None:
-    """Set trailing stop state in Redis."""
+    """Set trailing stop state in Redis (includes peak PnL for exit prompt)."""
     key = f"{TRAILING_KEY_PREFIX}:{position_id}"
     pipe = redis.pipeline()
     pipe.hset(key, mapping={
         "highest_price": str(highest_price),
         "lowest_price": str(lowest_price),
+        "peak_pnl_percent": str(peak_pnl_percent),
     })
     pipe.expire(key, TRAILING_TTL)
     await pipe.execute()
@@ -559,7 +562,7 @@ async def evaluate_mission_risk(
         else:
             peak = current_price
 
-        # Update peak
+        # Update peak price and peak PnL
         if direction == "LONG":
             new_highest = max(peak, current_price)
             new_lowest = trailing_state["lowest_price"] if trailing_state else current_price
@@ -567,7 +570,18 @@ async def evaluate_mission_risk(
             new_highest = trailing_state["highest_price"] if trailing_state else current_price
             new_lowest = min(peak, current_price)
 
-        await set_trailing_state(redis, position_id, new_highest, new_lowest)
+        # Track peak unrealized PnL % (used by LLM exit prompt)
+        if entry_price > 0:
+            if direction == "LONG":
+                current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            else:
+                current_pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        else:
+            current_pnl_pct = 0
+        prev_peak_pnl = trailing_state.get("peak_pnl_percent", 0) if trailing_state else 0
+        new_peak_pnl = max(prev_peak_pnl, current_pnl_pct)
+
+        await set_trailing_state(redis, position_id, new_highest, new_lowest, new_peak_pnl)
 
         triggered, trailing_stop_price = check_trailing_stop(
             direction=direction,
