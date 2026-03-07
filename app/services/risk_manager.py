@@ -32,6 +32,9 @@ RISK_PROFILES = {
         "max_drawdown_pct": 10.0,
         "max_funding_cost_pct": 1.0,
         "max_leverage": 1,
+        "max_positions": 2,
+        "max_per_bucket": 1,           # must diversify across buckets
+        "max_margin_utilization": 0.25, # halt new entries above 25%
     },
     "MODERATE": {
         "stop_loss_pct": 5.0,
@@ -41,6 +44,9 @@ RISK_PROFILES = {
         "max_drawdown_pct": 20.0,
         "max_funding_cost_pct": 2.0,
         "max_leverage": 2,
+        "max_positions": 4,
+        "max_per_bucket": 2,           # max 2 per correlation sector
+        "max_margin_utilization": 0.50, # halt new entries above 50%
     },
     "AGGRESSIVE": {
         "stop_loss_pct": 8.0,
@@ -50,6 +56,9 @@ RISK_PROFILES = {
         "max_drawdown_pct": 30.0,
         "max_funding_cost_pct": 3.0,
         "max_leverage": 3,
+        "max_positions": 5,
+        "max_per_bucket": 3,           # bounded by bucket caps
+        "max_margin_utilization": 0.75, # halt new entries above 75%
     },
 }
 

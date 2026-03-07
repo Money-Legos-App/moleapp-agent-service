@@ -794,55 +794,69 @@ class ExecutionWorkerPool:
         Fast, deterministic checks that skip the LLM call for obvious rejections.
         Returns a rejection reason string, or None if the LLM should decide.
         """
-        # 1) Portfolio concentration: reject if already >= 2 open positions
-        if len(existing_positions) >= 2:
-            return "max_positions_reached"
+        from app.services.risk_manager import get_risk_profile, CORRELATION_BUCKETS
 
-        # 2) Insufficient margin: reject if withdrawable < 5% of account value
+        risk_level = mission_context.get("risk_level", "MODERATE")
+        profile = get_risk_profile(risk_level)
+
+        # 1) Max positions per risk level (conservative=2, moderate=4, aggressive=5)
+        max_positions = profile.get("max_positions", 2)
+        if len(existing_positions) >= max_positions:
+            return f"max_positions_reached ({max_positions})"
+
+        # 2) Margin utilization limit per risk level
         withdrawable = account.get("withdrawable", 0)
         account_value = account.get("account_value", 0)
-        if account_value > 0 and withdrawable / account_value < 0.05:
-            return "insufficient_margin"
+        max_margin_util = profile.get("max_margin_utilization", 0.50)
+        if account_value > 0:
+            margin_used = account_value - withdrawable
+            utilization = margin_used / account_value
+            if utilization >= max_margin_util:
+                return f"margin_utilization_exceeded ({utilization:.0%} >= {max_margin_util:.0%})"
 
-        # 3) Mission lifecycle: early phase (day 1-2) should be conservative — reject LOW confidence
+        # 3) Per-bucket concentration limit
+        max_per_bucket = profile.get("max_per_bucket", 2)
+        new_asset = signal["asset"]
+        new_bucket = CORRELATION_BUCKETS.get(new_asset, "uncorrelated")
+        bucket_count = sum(
+            1 for p in existing_positions
+            if CORRELATION_BUCKETS.get(p["asset"], "uncorrelated") == new_bucket
+        )
+        if bucket_count >= max_per_bucket:
+            return f"bucket_concentration ({new_bucket}: {bucket_count}/{max_per_bucket})"
+
+        # 4) Mission lifecycle: early phase (day 1-2) — reject LOW confidence
         mission_day = mission_context.get("mission_day", 1)
         if mission_day <= 2 and signal.get("confidence") == "LOW":
             return "low_confidence_early_mission"
 
-        # 4) Late mission wind-down: last 5 days, reject new entries to avoid being stuck
+        # 5) Late mission wind-down: last 5 days, reject new entries
         days_remaining = mission_context.get("days_remaining", 30)
         if days_remaining <= 5:
             return "mission_winding_down"
 
-        # 5) Risk level vs leverage mismatch: CONSERVATIVE missions reject leverage > 1
-        risk_level = mission_context.get("risk_level", "MODERATE")
+        # 6) Risk level vs leverage mismatch
         rec_leverage = signal.get("recommended_leverage", 1)
         if risk_level == "CONSERVATIVE" and rec_leverage > 1:
             return "leverage_exceeds_conservative_limit"
 
-        # 6) Heavy drawdown guard: if mission PnL < -15%, skip LOW confidence signals
+        # 7) Heavy drawdown guard: if PnL < -15%, only HIGH confidence
         total_pnl_percent = mission_context.get("total_pnl_percent", 0)
         if total_pnl_percent < -15 and signal.get("confidence") != "HIGH":
             return "drawdown_guard"
 
-        # 7) Correlation bucket: reject if adding this asset exceeds bucket cap
+        # 8) Correlation bucket leverage cap (aggregate)
         from app.config import get_settings as _get_settings
         _settings = _get_settings()
         if _settings.correlation_bucketing_enabled:
             from app.services.risk_manager import check_correlation_bucket_exceeded
-            bucket_caps = {
-                "btc_correlated": _settings.correlation_bucket_btc_cap,
-                "eth_correlated": _settings.correlation_bucket_eth_cap,
-                "uncorrelated": _settings.correlation_bucket_uncorrelated_cap,
-            }
             exceeded, reason = check_correlation_bucket_exceeded(
-                new_asset=signal["asset"],
+                new_asset=new_asset,
                 new_leverage=signal.get("recommended_leverage", 1),
-                new_margin=account.get("withdrawable", 0) * 0.1,  # estimate 10% allocation
+                new_margin=withdrawable * 0.1,
                 existing_positions=existing_positions,
-                account_value=account.get("account_value", 0),
+                account_value=account_value,
                 max_mission_leverage=mission_context.get("max_leverage", 2),
-                bucket_caps=bucket_caps,
             )
             if exceeded:
                 return reason
