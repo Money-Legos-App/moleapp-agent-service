@@ -199,8 +199,13 @@ class LangfuseClient:
         Fetch a prompt from Langfuse Prompt Management.
 
         Returns:
-            (langfuse_prompt_object, compiled_text)
+            (langfuse_prompt_object, raw_template_text)
             Returns (None, fallback) on any failure.
+
+        Note: The returned prompt object has a .compile(**kwargs) method
+        that handles {{variable}} substitution (Mustache syntax).
+        Callers should use prompt.compile() for Langfuse prompts,
+        NOT Python str.format() which uses {variable} syntax.
         """
         if not self.enabled:
             return None, fallback
