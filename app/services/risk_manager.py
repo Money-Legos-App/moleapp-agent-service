@@ -163,21 +163,25 @@ def calculate_dynamic_stop_loss_pct(
     """
     Calculate leverage-aware stop loss percentage.
 
-    The key insight: the stop-loss percentage must ALWAYS be smaller than the
-    distance from entry to liquidation. At high leverage, liquidation is very
-    close to entry, so the SL must be tighter than the profile default.
+    Key distinction: 1/leverage is the distance to BANKRUPTCY (margin = $0),
+    but Hyperliquid liquidates at the Maintenance Margin Requirement (MMR)
+    BEFORE bankruptcy. The actual liquidation distance is (1/leverage - MMR).
+
+    Without subtracting MMR, at high leverage the SL and liquidation trigger
+    can race — if the exchange wins, the user pays a liquidation penalty.
 
     Logic:
-    - Calculate the max safe SL% (distance to liquidation minus buffer)
-    - Use min(profile_sl, max_safe_sl) to ensure SL never lands behind liquidation
-    - At low leverage (1-3x), max_safe_sl is very large (33%+), so profile wins
-    - At high leverage (10x+), max_safe_sl shrinks, forcing tighter stops
+    - Calculate true liquidation distance: (1/leverage) - MMR
+    - Apply safety buffer (20% of that distance)
+    - Use min(profile_sl, dynamic_sl) so SL always triggers before liquidation
+    - At low leverage (1-3x), profile SL wins (dynamic is huge)
+    - At high leverage (10x+), dynamic SL forces tighter stops
 
     Args:
         asset: Trading pair (e.g., "ETH-USD")
         leverage: Actual leverage used
         profile_sl_pct: Base SL% from risk profile (e.g., 5.0)
-        liquidation_buffer_pct: Extra buffer kept between SL and liquidation (default 20%)
+        liquidation_buffer_pct: Safety buffer as % of liquidation distance (default 20%)
 
     Returns:
         SL percentage to use
@@ -187,24 +191,25 @@ def calculate_dynamic_stop_loss_pct(
 
     mmr = MAINTENANCE_MARGIN_RATIOS.get(asset, DEFAULT_MAINTENANCE_MARGIN)
 
-    # Distance from entry to liquidation as percentage ≈ (1/leverage - mmr) * 100
-    # Simplified: for isolated margin, liq distance ≈ (1 - mmr * leverage) / leverage
-    # More conservative approximation that works across margin modes:
-    liq_distance_pct = (1.0 / leverage) * 100  # e.g., 10x → 10%, 2x → 50%
+    # Distance to LIQUIDATION (not bankruptcy):
+    # bankruptcy_distance = 1/leverage
+    # liquidation_distance = bankruptcy_distance - MMR
+    # e.g., 20x BTC: (1/20) - 0.0333 = 0.0167 (1.67%)
+    # e.g., 2x ETH:  (1/2)  - 0.0333 = 0.4667 (46.67%)
+    liquidation_distance = (1.0 / leverage) - mmr
 
-    # Max safe SL = liquidation distance minus a buffer (so SL triggers before liq)
-    # Buffer is a percentage OF the liquidation distance
-    buffer_amount = liq_distance_pct * (liquidation_buffer_pct / 100)
-    max_safe_sl_pct = liq_distance_pct - buffer_amount
+    # Floor at 0.5% to handle extreme leverage where liq_distance goes negative
+    liquidation_distance = max(0.005, liquidation_distance)
 
-    if max_safe_sl_pct <= 0:
-        # Extremely high leverage — force minimum viable SL
+    # Apply safety buffer: SL triggers at (1 - buffer%) of the liquidation distance
+    # e.g., 20x BTC: 0.0167 * 0.80 = 0.01336 → SL at 1.34%, liq at 1.67%, gap = 0.33%
+    dynamic_sl_pct = liquidation_distance * (1.0 - liquidation_buffer_pct / 100) * 100
+
+    if dynamic_sl_pct <= 0:
         return 0.5
 
-    # Use the SMALLER of profile SL and max safe SL
-    # At low leverage: max_safe_sl is huge (40%+), so profile_sl wins → normal behavior
-    # At high leverage: max_safe_sl shrinks, forcing tighter stops → safety kicks in
-    return min(profile_sl_pct, max_safe_sl_pct)
+    # Use the STRICTER (smaller) of profile SL and dynamic SL
+    return min(profile_sl_pct, dynamic_sl_pct)
 
 
 # ==================
