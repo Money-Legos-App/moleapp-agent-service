@@ -411,10 +411,12 @@ class HyperliquidClient:
         start_ms = now_ms - (lookback * ms)
 
         data = await self._info_request("candleSnapshot", {
-            "coin": coin,
-            "interval": interval,
-            "startTime": start_ms,
-            "endTime": now_ms,
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": start_ms,
+                "endTime": now_ms,
+            }
         })
 
         candles = []
