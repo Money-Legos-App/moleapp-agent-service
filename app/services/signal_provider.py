@@ -282,6 +282,12 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         ),
                         "stop_loss_percent": signal_response.get("stop_loss_percent", 5),
                         "take_profit_percent": signal_response.get("take_profit_percent", 15),
+                        # HL-aligned exit parameters
+                        "max_hold_hours": signal_response.get("max_hold_hours", 72),
+                        "trailing_stop": signal_response.get("trailing_stop", None),
+                        "funding_exit_threshold": signal_response.get("funding_exit_threshold", None),
+                        "thesis_invalidation": signal_response.get("thesis_invalidation", ""),
+                        # Legacy field (kept for backwards compat)
                         "time_horizon": signal_response.get("time_horizon", "3d"),
                         "rag_context_ids": [p.get("id") for p in patterns] if patterns else [],
                         "max_drawdown_30d": risk.get("max_drawdown_30d"),

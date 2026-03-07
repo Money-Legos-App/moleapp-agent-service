@@ -51,6 +51,14 @@ You must respond in valid JSON format only. No text outside the JSON structure.
 - Funding Rate: {funding_rate_hourly:.4f}% per hour ({funding_rate_apr:.1f}% APR)
 - Open Interest: ${open_interest:,.0f}
 
+## Hyperliquid Exchange Mechanics
+This is a perpetual futures exchange. Key mechanics that affect your decisions:
+- Funding is charged EVERY HOUR. A 0.01% hourly rate = 0.24%/day = 87.6% APR cost.
+- Going LONG when funding is positive means YOU PAY funding. Going SHORT when funding is negative means YOU PAY funding.
+- When funding is extreme (>0.05%/hr), it often mean-reverts — crowded trades unwind.
+- There is no expiry on perps — positions can be held indefinitely, but funding accumulates.
+- Liquidation happens at the maintenance margin level. Higher leverage = closer liquidation.
+
 ## Historical Pattern Context (from similar market conditions)
 {pattern_context}
 
@@ -60,9 +68,9 @@ You must respond in valid JSON format only. No text outside the JSON structure.
 - Sample Size: {sample_count} patterns
 
 ## Task
-Analyze the above data as a hedge fund CIO. Consider:
+Analyze the above data as a hedge fund CIO managing perpetual futures on Hyperliquid. Consider:
 1. Is there a clear directional edge? If not, the answer is no trade.
-2. Funding cost analysis: If going LONG with positive funding, what is the hourly bleed? Is the expected move large enough to overcome it? Same logic for SHORT with negative funding.
+2. Funding cost analysis: Calculate the hourly funding bleed for your direction. How many hours can you hold before funding erodes your edge? If funding is a tailwind, factor that into your profit target.
 3. Open Interest analysis: Is OI increasing (new money entering = conviction) or decreasing (positions unwinding = weakening trend)?
 4. What is the risk/reward ratio? Only proceed if reward >= 2x risk.
 5. What would invalidate this trade thesis?
@@ -75,7 +83,7 @@ Respond with the following JSON structure:
   "direction": "LONG" or "SHORT" or null,
   "confidence": "LOW" or "MEDIUM" or "HIGH",
   "recommended_leverage": 1-3,
-  "strategy_tag": "e.g., momentum_breakout, funding_carry, mean_reversion, trend_follow",
+  "strategy_tag": "momentum_breakout" or "funding_carry" or "mean_reversion" or "trend_follow" or "volatility_squeeze",
   "reasoning": "Clear explanation of your analysis and thesis (2-3 sentences)",
   "entry_zone": {{
     "min": price,
@@ -85,10 +93,25 @@ Respond with the following JSON structure:
   "take_profit_percent": 5-30,
   "risk_reward_ratio": number,
   "funding_rate_impact": "tailwind" or "headwind" or "neutral",
-  "time_horizon": "1d" or "3d" or "7d",
+  "max_hold_hours": integer (4-168),
+  "trailing_stop": {{
+    "activate_at_percent": number,
+    "trail_percent": number
+  }},
+  "funding_exit_threshold": number or null,
   "thesis_invalidation": "What would make you close this trade immediately"
 }}
 ```
+
+## Field Definitions for Exit Management
+- **max_hold_hours**: Maximum hours to hold this position before forced review. Based on:
+  - funding_carry: 4-24h (capture the rate, exit before reversal)
+  - mean_reversion: 8-48h (quick snap-back expected)
+  - momentum_breakout: 24-72h (needs time to play out)
+  - trend_follow: 72-168h (multi-day trend, wider stops)
+  - volatility_squeeze: 12-48h (breakout timing is critical)
+- **trailing_stop**: When unrealized profit hits activate_at_percent, start trailing stop at trail_percent below the peak. Example: {{"activate_at_percent": 5, "trail_percent": 2}} means once position is +5%, trail a stop 2% below the highest price reached.
+- **funding_exit_threshold**: If funding rate moves against your position beyond this hourly %, exit regardless. Set null if funding is not a factor (e.g., you're already riding a tailwind). Example: 0.05 means exit if hourly funding against you exceeds 0.05%.
 
 If conditions are not favorable for trading, set should_trade to false and explain why in reasoning. No trade is a valid and often correct decision.
 """
