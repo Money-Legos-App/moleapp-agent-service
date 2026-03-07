@@ -66,25 +66,32 @@ def get_risk_profile(risk_level: str) -> dict:
 # Maps each tradeable asset to its correlation bucket
 CORRELATION_BUCKETS = {
     "BTC-USD": "btc_correlated",
+    "DOGE-USD": "btc_correlated",
     "ETH-USD": "eth_correlated",
     "ARB-USD": "eth_correlated",
-    "OP-USD": "eth_correlated",
-    "SOL-USD": "uncorrelated",
-    "XRP-USD": "uncorrelated",
-    "ADA-USD": "uncorrelated",
-    "DOGE-USD": "btc_correlated",
-    "LINK-USD": "uncorrelated",
-    "AVAX-USD": "uncorrelated",
-    "SUI-USD": "uncorrelated",
-    "WIF-USD": "uncorrelated",
-    "kPEPE-USD": "uncorrelated",
+    "SOL-USD": "sol_ecosystem",
+    "WIF-USD": "sol_ecosystem",
+    "POPCAT-USD": "sol_ecosystem",
+    "SUI-USD": "alt_l1",
+    "SEI-USD": "alt_l1",
+    "AVAX-USD": "alt_l1",
+    "NEAR-USD": "alt_l1",
+    "TAO-USD": "ai_narrative",
+    "FET-USD": "ai_narrative",
+    "PENDLE-USD": "defi",
+    "kPEPE-USD": "meme",
 }
 
-# Default caps (overridden by settings at runtime)
+# Default caps per sector (overridden by settings at runtime)
 BUCKET_CAPS = {
-    "btc_correlated": 50.0,
-    "eth_correlated": 35.0,
-    "uncorrelated": 15.0,
+    "btc_correlated": 40.0,
+    "eth_correlated": 30.0,
+    "sol_ecosystem": 25.0,
+    "alt_l1": 20.0,
+    "ai_narrative": 20.0,
+    "defi": 15.0,
+    "meme": 15.0,
+    "uncorrelated": 15.0,  # fallback for dynamically rotated assets
 }
 
 

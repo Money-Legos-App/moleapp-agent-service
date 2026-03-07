@@ -176,6 +176,28 @@ class Settings(BaseSettings):
         description="Entry zone width % around ideal price",
     )
 
+    # Dynamic Asset Rotation
+    dynamic_asset_rotation_enabled: bool = Field(
+        default=False,
+        alias="DYNAMIC_ASSET_ROTATION_ENABLED",
+        description="Enable daily volume-based asset rotation",
+    )
+    dynamic_asset_rotation_hour: int = Field(
+        default=1,
+        alias="DYNAMIC_ASSET_ROTATION_HOUR",
+        description="UTC hour to run rotation (1 = after daily close settles)",
+    )
+    dynamic_asset_min_volume_24h: float = Field(
+        default=15_000_000,
+        alias="DYNAMIC_ASSET_MIN_VOLUME_24H",
+        description="Minimum 24h volume ($) to qualify for rotation",
+    )
+    dynamic_asset_max_count: int = Field(
+        default=15,
+        alias="DYNAMIC_ASSET_MAX_COUNT",
+        description="Max assets in the rotated list",
+    )
+
     # PnL Fan-Out
     pnl_fanout_batch_size: int = Field(
         default=5,
@@ -247,7 +269,7 @@ class Settings(BaseSettings):
     # Trading constraints
     # Note: stored as comma-separated string to avoid pydantic-settings JSON parsing
     allowed_assets_str: str = Field(
-        default="ETH-USD,BTC-USD,SOL-USD,XRP-USD,DOGE-USD,LINK-USD,AVAX-USD,ARB-USD,OP-USD,ADA-USD,SUI-USD,WIF-USD,kPEPE-USD",
+        default="BTC-USD,ETH-USD,SOL-USD,SUI-USD,SEI-USD,AVAX-USD,TAO-USD,FET-USD,NEAR-USD,WIF-USD,POPCAT-USD,kPEPE-USD,DOGE-USD,PENDLE-USD,ARB-USD",
         alias="ALLOWED_ASSETS",
     )
     max_leverage_conservative: int = 1
@@ -504,19 +526,21 @@ class HyperliquidConfig:
 
     # Asset mappings
     ASSET_DECIMALS = {
-        "ETH-USD": 18,
         "BTC-USD": 8,
+        "ETH-USD": 18,
         "SOL-USD": 9,
-        "XRP-USD": 6,
-        "DOGE-USD": 8,
-        "LINK-USD": 18,
-        "AVAX-USD": 18,
-        "ARB-USD": 18,
-        "OP-USD": 18,
-        "ADA-USD": 6,
         "SUI-USD": 9,
+        "SEI-USD": 18,
+        "AVAX-USD": 18,
+        "TAO-USD": 18,
+        "FET-USD": 18,
+        "NEAR-USD": 18,
         "WIF-USD": 6,
+        "POPCAT-USD": 18,
         "kPEPE-USD": 18,
+        "DOGE-USD": 8,
+        "PENDLE-USD": 18,
+        "ARB-USD": 18,
     }
 
     @classmethod

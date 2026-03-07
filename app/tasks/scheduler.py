@@ -127,6 +127,20 @@ class AgentScheduler:
             replace_existing=True,
         )
 
+        # Dynamic Asset Rotation (daily, volume-based list update)
+        if self.settings.dynamic_asset_rotation_enabled:
+            self._scheduler.add_job(
+                self._run_asset_rotation,
+                trigger=CronTrigger(
+                    hour=self.settings.dynamic_asset_rotation_hour,
+                    minute=0,
+                ),
+                id="asset_rotation",
+                name="Dynamic Asset Rotation",
+                max_instances=1,
+                replace_existing=True,
+            )
+
         # Deposit checks are event-driven (enqueued on mission activation via arq)
         # — no cron polling needed
 
@@ -410,6 +424,22 @@ class AgentScheduler:
 
         except Exception as e:
             logger.error("Stuck mission recovery task failed", error=str(e))
+
+    async def _run_asset_rotation(self) -> None:
+        """Run daily dynamic asset rotation based on volume/turnover ranking."""
+        try:
+            from app.tasks.asset_rotation import rotate_assets
+
+            result = await rotate_assets()
+            logger.info(
+                "Asset rotation completed",
+                status=result.get("status"),
+                total_assets=len(result.get("assets", [])),
+                added=result.get("added", []),
+                removed=result.get("removed", []),
+            )
+        except Exception as e:
+            logger.error("Asset rotation failed", error=str(e))
 
     def get_job_status(self) -> dict:
         """Get status of all scheduled jobs."""

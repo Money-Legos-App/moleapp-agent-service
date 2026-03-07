@@ -901,6 +901,9 @@ class HyperliquidClient:
     _FALLBACK_ASSET_INDICES = {
         "BTC": 0, "ETH": 1, "SOL": 2, "DOGE": 3, "AVAX": 4,
         "MATIC": 5, "ARB": 6, "OP": 7, "LINK": 8, "UNI": 9,
+        "SUI": 28, "SEI": 38, "TAO": 79, "FET": 71,
+        "NEAR": 46, "WIF": 84, "POPCAT": 114, "kPEPE": 36,
+        "PENDLE": 76,
     }
 
     async def _ensure_asset_index_cache(self) -> None:

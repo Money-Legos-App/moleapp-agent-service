@@ -141,10 +141,28 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
     risk_metrics: Dict[str, Dict[str, Any]] = {}
     errors: List[str] = []
 
+    # Determine asset list: dynamic rotation (Redis) > static (settings)
+    active_assets = settings.allowed_assets
+    if settings.dynamic_asset_rotation_enabled:
+        try:
+            from app.services.execution_queue import get_redis as _get_redis
+            _r = await _get_redis()
+            dynamic_raw = await _r.get("agent:dynamic:allowed_assets")
+            if dynamic_raw:
+                import json as _json
+                dynamic_list = _json.loads(
+                    dynamic_raw if isinstance(dynamic_raw, str) else dynamic_raw.decode()
+                )
+                if dynamic_list:
+                    active_assets = dynamic_list
+                    logger.info("Using dynamic asset list", count=len(active_assets))
+        except Exception as dyn_err:
+            logger.warning("Dynamic asset list unavailable, using static", error=str(dyn_err))
+
     # Fetch ALL market data in 1 metaAndAssetCtxs call + N concurrent L2 calls
     # instead of 2N calls (1 meta + 1 L2 per asset sequentially)
     try:
-        market_data = await hl_client.get_bulk_market_data(settings.allowed_assets)
+        market_data = await hl_client.get_bulk_market_data(active_assets)
     except Exception as e:
         logger.error("Failed to fetch bulk market data", error=str(e))
         errors.append(f"Bulk market data fetch failed: {str(e)}")
@@ -171,7 +189,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
             return asset, await hl_client.get_multi_timeframe_analysis(coin)
 
         tf_results = await asyncio.gather(
-            *[_get_tf(a) for a in settings.allowed_assets],
+            *[_get_tf(a) for a in active_assets],
             return_exceptions=True,
         )
         for result in tf_results:
@@ -400,7 +418,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
     try:
         # Run all asset analyses concurrently (bounded by semaphore)
         results = await asyncio.gather(
-            *[_analyze_asset(asset) for asset in settings.allowed_assets],
+            *[_analyze_asset(asset) for asset in active_assets],
             return_exceptions=True,
         )
         for result in results:
