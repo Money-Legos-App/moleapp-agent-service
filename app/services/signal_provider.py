@@ -181,20 +181,36 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
     except Exception:
         redis = None
 
-    # Multi-timeframe technical analysis (concurrent for all assets)
+    # Multi-timeframe technical analysis: read pre-computed summaries from Redis
+    # (cached every 5 min by market_data_worker.refresh_candle_summaries)
     tf_summaries: Dict[str, str] = {}
     try:
-        async def _get_tf(asset: str):
-            coin = asset.replace("-USD", "")
-            return asset, await hl_client.get_multi_timeframe_analysis(coin)
+        if redis:
+            from app.workers.market_data_worker import CANDLE_SUMMARY_PREFIX
+            pipe = redis.pipeline()
+            for asset in active_assets:
+                pipe.get(f"{CANDLE_SUMMARY_PREFIX}{asset}")
+            cached_results = await pipe.execute()
+            for asset, raw in zip(active_assets, cached_results):
+                if raw:
+                    tf_summaries[asset] = raw if isinstance(raw, str) else raw.decode()
 
-        tf_results = await asyncio.gather(
-            *[_get_tf(a) for a in active_assets],
-            return_exceptions=True,
-        )
-        for result in tf_results:
-            if isinstance(result, tuple):
-                tf_summaries[result[0]] = result[1]
+        # Fallback: live fetch for any assets missing from cache
+        missing = [a for a in active_assets if a not in tf_summaries]
+        if missing:
+            logger.info("Candle cache miss, fetching live", count=len(missing))
+
+            async def _get_tf(asset: str):
+                coin = asset.replace("-USD", "")
+                return asset, await hl_client.get_multi_timeframe_analysis(coin)
+
+            tf_results = await asyncio.gather(
+                *[_get_tf(a) for a in missing],
+                return_exceptions=True,
+            )
+            for result in tf_results:
+                if isinstance(result, tuple):
+                    tf_summaries[result[0]] = result[1]
     except Exception as e:
         logger.warning("Multi-timeframe fetch failed", error=str(e))
 

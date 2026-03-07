@@ -127,6 +127,16 @@ class AgentScheduler:
             replace_existing=True,
         )
 
+        # Candle Summary Cache (background fetch, avoids 30 HTTP calls in trading cycle)
+        self._scheduler.add_job(
+            self._run_candle_refresh,
+            trigger=IntervalTrigger(minutes=5),
+            id="candle_refresh",
+            name="Candle Summary Cache",
+            max_instances=1,
+            replace_existing=True,
+        )
+
         # Dynamic Asset Rotation (daily, volume-based list update)
         if self.settings.dynamic_asset_rotation_enabled:
             self._scheduler.add_job(
@@ -424,6 +434,21 @@ class AgentScheduler:
 
         except Exception as e:
             logger.error("Stuck mission recovery task failed", error=str(e))
+
+    async def _run_candle_refresh(self) -> None:
+        """
+        Background candle fetch: compute technical summaries for all active
+        assets and cache in Redis. Runs every 5 min so the 15-min trading
+        cycle reads pre-computed data (0 HTTP calls in the hot path).
+        """
+        try:
+            from app.workers.market_data_worker import refresh_candle_summaries
+
+            summaries = await refresh_candle_summaries()
+            logger.debug("Candle summaries refreshed", assets=len(summaries))
+
+        except Exception as e:
+            logger.error("Candle summary refresh failed", error=str(e))
 
     async def _run_asset_rotation(self) -> None:
         """Run daily dynamic asset rotation based on volume/turnover ranking."""

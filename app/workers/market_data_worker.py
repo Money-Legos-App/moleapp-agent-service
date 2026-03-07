@@ -5,6 +5,10 @@ Fetches ALL market prices from Hyperliquid in a single API call,
 caches them in Redis, then fans out per-mission PnL update jobs
 to the arq queue.
 
+Also caches candle-based technical summaries (RSI, EMA, ATR) in Redis
+so the trading cycle reads pre-computed data instead of making 30 HTTP
+requests per cycle.
+
 This replaces the old pattern of N API calls (one per mission)
 with 1 API call + N Redis reads.
 """
@@ -13,7 +17,7 @@ import asyncio
 import json
 import random
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import structlog
 
@@ -22,6 +26,8 @@ logger = structlog.get_logger(__name__)
 # Redis keys
 MARKET_PRICES_KEY = "agent:market:prices"
 MARKET_PRICES_UPDATED_KEY = "agent:market:prices:updated_at"
+CANDLE_SUMMARY_PREFIX = "agent:candles:summary:"
+CANDLE_SUMMARY_UPDATED_KEY = "agent:candles:updated_at"
 
 
 async def refresh_market_prices() -> Dict[str, Any]:
@@ -75,6 +81,88 @@ async def refresh_market_prices() -> Dict[str, Any]:
 
     finally:
         await hl_client.close()
+
+
+async def refresh_candle_summaries() -> Dict[str, str]:
+    """
+    Fetch candles for all active assets (semaphore-batched), compute
+    technical summaries, and cache in Redis.
+
+    Runs every 5 min as a background task so the trading cycle reads
+    pre-computed data from Redis (0 HTTP requests in the hot path).
+
+    Returns:
+        Dict of asset -> summary string
+    """
+    from app.services.hyperliquid import HyperliquidClient
+    from app.services.execution_queue import get_redis
+    from app.config import get_settings
+
+    settings = get_settings()
+    redis = await get_redis()
+
+    # Resolve active asset list (dynamic > static)
+    active_assets: List[str] = list(settings.allowed_assets)
+    if settings.dynamic_asset_rotation_enabled:
+        try:
+            dynamic_raw = await redis.get("agent:dynamic:allowed_assets")
+            if dynamic_raw:
+                dynamic_list = json.loads(
+                    dynamic_raw if isinstance(dynamic_raw, str) else dynamic_raw.decode()
+                )
+                if dynamic_list:
+                    active_assets = dynamic_list
+        except Exception:
+            pass
+
+    hl_client = HyperliquidClient()
+    semaphore = asyncio.Semaphore(5)  # max 5 concurrent HL requests
+    summaries: Dict[str, str] = {}
+
+    async def _fetch_one(asset: str):
+        coin = asset.replace("-USD", "")
+        async with semaphore:
+            try:
+                summary = await hl_client.get_multi_timeframe_analysis(coin)
+                return asset, summary
+            except Exception as e:
+                logger.warning("Candle summary fetch failed", coin=coin, error=str(e))
+                return asset, None
+
+    try:
+        results = await asyncio.gather(
+            *[_fetch_one(a) for a in active_assets],
+            return_exceptions=True,
+        )
+
+        pipe = redis.pipeline()
+        cached = 0
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            asset, summary = result
+            if summary:
+                summaries[asset] = summary
+                pipe.set(
+                    f"{CANDLE_SUMMARY_PREFIX}{asset}",
+                    summary,
+                    ex=600,  # 10 min TTL (refresh runs every 5 min)
+                )
+                cached += 1
+
+        pipe.set(CANDLE_SUMMARY_UPDATED_KEY, datetime.utcnow().isoformat(), ex=600)
+        await pipe.execute()
+
+        logger.info(
+            "Candle summaries cached",
+            assets_cached=cached,
+            total_assets=len(active_assets),
+        )
+
+    finally:
+        await hl_client.close()
+
+    return summaries
 
 
 async def fan_out_pnl_jobs() -> int:
