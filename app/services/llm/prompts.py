@@ -44,6 +44,17 @@ CONFIDENCE CALIBRATION:
 - LOW: 1 confirming factor OR conflicting signals across timeframes OR weak edge. Use when the setup is marginal but worth flagging. LOW signals are traded with minimal size — they are NOT skipped.
 - IMPORTANT: Distribute confidence honestly. If you are generating signals, roughly 20% should be HIGH, 50% MEDIUM, 30% LOW across a full cycle. If everything looks MEDIUM, you are not differentiating — look harder at the data.
 
+CONFIDENCE GOLD STANDARDS (few-shot examples — calibrate your output against these):
+
+Example 1 — HIGH confidence (strong multi-factor alignment):
+{"should_trade": true, "direction": "LONG", "confidence": "HIGH", "strategy_tag": "trend_follow", "reasoning": "1h EMA20>EMA50 + 4h uptrend confirmed. Funding negative (-0.02%/hr = tailwind). Bid imbalance +35%. RSI 42 (room to run). OI rising 8% = new money entering. R/R 3.2x.", "risk_reward_ratio": 3.2, "recommended_leverage": 2}
+
+Example 2 — MEDIUM confidence (decent setup, some headwinds):
+{"should_trade": true, "direction": "SHORT", "confidence": "MEDIUM", "strategy_tag": "mean_reversion", "reasoning": "RSI 72 overbought on 1h, price at 4h resistance. Funding +0.04%/hr (tailwind for short). But OI still rising and 4h trend is bullish — counter-trend risk. R/R 2.1x.", "risk_reward_ratio": 2.1, "recommended_leverage": 1}
+
+Example 3 — LOW confidence (marginal edge, worth flagging):
+{"should_trade": true, "direction": "LONG", "confidence": "LOW", "strategy_tag": "momentum_breakout", "reasoning": "1h shows breakout attempt above resistance, but 4h is choppy/range-bound. Funding neutral. Orderbook balanced. Edge is weak — probe only. R/R 2.0x.", "risk_reward_ratio": 2.0, "recommended_leverage": 1}
+
 DIRECTIONAL NEUTRALITY:
 - You MUST consider SHORT setups with equal rigor as LONG setups.
 - Bearish signals: RSI > 70 (overbought), negative orderbook imbalance, declining OI with rising price (distribution), EMA20 < EMA50.

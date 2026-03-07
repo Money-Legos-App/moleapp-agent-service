@@ -104,6 +104,11 @@ class DeepSeekClient:
             "response_format": {"type": "json_object"},
         }
 
+        # Add top_p for nucleus sampling when temperature > 0.4
+        # Constrains creative sampling to the top 90% of tokens
+        if temperature > 0.4:
+            payload["top_p"] = 0.9
+
         logger.info(
             "AUDIT LLM request",
             model=self.model,
@@ -261,7 +266,7 @@ class DeepSeekClient:
         try:
             response = await self._call_api(
                 messages,
-                temperature=0.3,
+                temperature=0.55,
                 trace=trace,
                 lf_prompt=lf_prompt,
                 generation_name="market_analysis",
