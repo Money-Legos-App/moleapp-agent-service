@@ -461,6 +461,9 @@ class ExecutionWorkerPool:
                 orders_executed = 0
                 orders_failed = 0
 
+                # Track intra-cycle margin usage to avoid stale withdrawable
+                margin_committed_this_cycle = 0.0
+
                 # Block new entries if risk monitor is unhealthy
                 if settings.heartbeat_block_new_entries:
                     monitor_unhealthy = await self._redis.get("agent:risk:monitor_unhealthy")
@@ -471,6 +474,9 @@ class ExecutionWorkerPool:
                         )
                         return {"success": True, "skipped": True, "reason": "risk_monitor_unhealthy"}
 
+                # Track assets opened this cycle to prevent intra-cycle duplicates
+                assets_opened_this_cycle = set()
+
                 for signal in market_state.signals:
                     asset = signal["asset"]
 
@@ -478,8 +484,10 @@ class ExecutionWorkerPool:
                     if asset not in mission_context["allowed_assets"]:
                         continue
 
-                    # Already has position in this asset
+                    # Already has position in this asset (from HL state or opened this cycle)
                     if any(p["asset"] == asset for p in existing_positions):
+                        continue
+                    if asset in assets_opened_this_cycle:
                         continue
 
                     # ── Rule-based pre-filter (skip LLM for obvious rejections) ──
@@ -515,24 +523,33 @@ class ExecutionWorkerPool:
                         position_size_percent = signal.get("position_size_percent", 10)
                     else:
                         # ── Legacy path: LLM user filter ──
-                        total_margin_used = sum(
-                            p.get("margin_used", 0) for p in existing_positions
-                        )
-                        lf_filter_prompt, _ = pm.get_user_filter_prompt(
-                            signal=signal,
-                            mission=mission_context,
-                            existing_positions=existing_positions,
-                            margin_used=total_margin_used,
-                            account_value=current_value,
-                        )
+                        try:
+                            total_margin_used = sum(
+                                p.get("margin_used", 0) for p in existing_positions
+                            )
+                            lf_filter_prompt, _ = pm.get_user_filter_prompt(
+                                signal=signal,
+                                mission=mission_context,
+                                existing_positions=existing_positions,
+                                margin_used=total_margin_used,
+                                account_value=current_value,
+                            )
 
-                        filter_result = await llm.filter_for_user(
-                            signal=signal,
-                            mission=mission_context,
-                            existing_positions=existing_positions,
-                            trace=trace,
-                            lf_prompt=lf_filter_prompt,
-                        )
+                            filter_result = await llm.filter_for_user(
+                                signal=signal,
+                                mission=mission_context,
+                                existing_positions=existing_positions,
+                                trace=trace,
+                                lf_prompt=lf_filter_prompt,
+                            )
+                        except Exception as filter_err:
+                            logger.warning(
+                                "LLM filter failed for signal, skipping",
+                                mission_id=mission_id,
+                                asset=asset,
+                                error=str(filter_err),
+                            )
+                            continue
 
                         if not filter_result.get("should_execute", False):
                             continue
@@ -542,7 +559,9 @@ class ExecutionWorkerPool:
                             mission_context["max_leverage"],
                         )
                         position_size_percent = filter_result.get("position_size_percent", 10)
-                    available_margin = account.get("withdrawable", 0)
+
+                    # Fix #5: Use margin adjusted for intra-cycle commitments
+                    available_margin = max(0, account.get("withdrawable", 0) - margin_committed_this_cycle)
                     position_margin = available_margin * (position_size_percent / 100)
                     market_price = market_state.market_data.get(asset, {}).get("price", 0)
 
@@ -636,6 +655,8 @@ class ExecutionWorkerPool:
                         await pipe.execute()
 
                         orders_executed += 1
+                        assets_opened_this_cycle.add(asset)
+                        margin_committed_this_cycle += position_margin
                         logger.info(
                             "Playbook created for Fast Actor",
                             playbook_id=pb.playbook_id,
@@ -693,6 +714,8 @@ class ExecutionWorkerPool:
 
                     if order_result.get("success"):
                         orders_executed += 1
+                        assets_opened_this_cycle.add(asset)
+                        margin_committed_this_cycle += position_margin
 
                         # Persist position + risk levels to DB
                         try:
@@ -765,6 +788,11 @@ class ExecutionWorkerPool:
 
                 if orders_executed > 0:
                     await circuit_breaker.record_success(mission_id)
+                if orders_failed > 0:
+                    await circuit_breaker.record_failure(
+                        mission_id,
+                        f"cycle {cycle_id}: {orders_failed} orders failed",
+                    )
                 return result
 
             finally:

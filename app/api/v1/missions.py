@@ -169,6 +169,22 @@ async def create_mission(
             detail=f"Invalid risk level. Must be one of: {valid_risk_levels}",
         )
 
+    # Validate allowed_assets against the platform's known asset list
+    from app.config import get_settings as _get_settings
+    _settings = _get_settings()
+    platform_assets = set(_settings.allowed_assets)
+    invalid_assets = [a for a in request.allowed_assets if a not in platform_assets]
+    if invalid_assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid assets: {invalid_assets}. Allowed: {sorted(platform_assets)}",
+        )
+    if not request.allowed_assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one allowed asset is required",
+        )
+
     # Create mission via wallet-service (includes wallet ownership validation)
     try:
         bridge = TurnkeyBridge()
@@ -251,9 +267,19 @@ async def create_mission(
                 logger.info("Vault not configured — skipping Master EOA creation")
         except Exception as vault_err:
             logger.error(
-                "Vault key creation failed (mission still created)",
+                "Vault key creation failed — aborting mission",
                 mission_id=mission_id_created,
                 error=str(vault_err),
+            )
+            # Clean up: mark mission as failed so it doesn't sit in PENDING without a key
+            try:
+                from app.services.database import update_mission_status
+                await update_mission_status(mission_id_created, "FAILED")
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create secure trading key. Please try again.",
             )
 
         # Determine duration
@@ -379,7 +405,14 @@ async def activate_mission(
             detail="Mission not found",
         )
 
-    if mission["status"] != "PENDING":
+    if mission["status"] not in ("PENDING", ):
+        # DEPOSITING means activation was already triggered (idempotency guard)
+        if mission["status"] == "DEPOSITING":
+            return {
+                "status": "depositing",
+                "mission_id": mission_id,
+                "message": "Mission is already being activated. Deposit is in progress.",
+            }
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Mission cannot be activated from '{mission['status']}' status. Must be PENDING.",
