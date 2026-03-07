@@ -539,6 +539,8 @@ class ExecutionWorkerPool:
                                 signal=signal,
                                 mission=mission_context,
                                 existing_positions=existing_positions,
+                                margin_used=total_margin_used,
+                                account_value=current_value,
                                 trace=trace,
                                 lf_prompt=lf_filter_prompt,
                             )

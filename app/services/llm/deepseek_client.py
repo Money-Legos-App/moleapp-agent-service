@@ -319,6 +319,8 @@ class DeepSeekClient:
         signal: Dict[str, Any],
         mission: Dict[str, Any],
         existing_positions: List[Dict[str, Any]],
+        margin_used: float = 0.0,
+        account_value: float = 0.0,
         # Langfuse instrumentation
         trace=None,
         lf_prompt=None,
@@ -330,6 +332,8 @@ class DeepSeekClient:
             signal: Trading signal from market analysis
             mission: User's mission parameters
             existing_positions: User's current open positions
+            margin_used: Total margin currently deployed (from clearinghouse)
+            account_value: Total account value (from clearinghouse)
 
         Returns:
             Execution decision dictionary
@@ -338,6 +342,8 @@ class DeepSeekClient:
             signal=signal,
             mission=mission,
             existing_positions=existing_positions,
+            margin_used=margin_used,
+            account_value=account_value,
         )
 
         messages = [
