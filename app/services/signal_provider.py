@@ -120,17 +120,18 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
         metadata={"cycle_id": cycle_id, "assets": settings.allowed_assets},
     )
 
-    # FAISS/RAG optional
+    # FAISS/RAG: skip entirely when disabled (saves ~12s model load per cycle)
     faiss_store = None
-    try:
-        from app.services.rag import FAISSStore
+    if not settings.disable_rag:
+        try:
+            from app.services.rag import FAISSStore
 
-        faiss_store = FAISSStore()
-        await faiss_store.initialize()
-        if not getattr(faiss_store, "is_ready", False):
-            faiss_store = None
-    except Exception as e:
-        logger.warning("FAISS not available, proceeding without RAG", error=str(e))
+            faiss_store = FAISSStore()
+            await faiss_store.initialize()
+            if not getattr(faiss_store, "is_ready", False):
+                faiss_store = None
+        except Exception as e:
+            logger.warning("FAISS not available, proceeding without RAG", error=str(e))
 
     llm = DeepSeekClient()
     hl_client = HyperliquidClient()
