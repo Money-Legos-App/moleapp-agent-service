@@ -505,37 +505,43 @@ class ExecutionWorkerPool:
                         )
                         continue
 
-                    # Fetch user filter prompt from Langfuse (fallback to local)
-                    # Pass actual margin utilization from clearinghouse state
-                    total_margin_used = sum(
-                        p.get("margin_used", 0) for p in existing_positions
-                    )
-                    lf_filter_prompt, _ = pm.get_user_filter_prompt(
-                        signal=signal,
-                        mission=mission_context,
-                        existing_positions=existing_positions,
-                        margin_used=total_margin_used,
-                        account_value=current_value,
-                    )
+                    # ── Fast Actor path: skip LLM filter, create Playbook ──
+                    if settings.fast_actor_enabled:
+                        # Deterministic sizing (same as LLM path below)
+                        adjusted_leverage = min(
+                            signal.get("leverage", 1),
+                            mission_context["max_leverage"],
+                        )
+                        position_size_percent = signal.get("position_size_percent", 10)
+                    else:
+                        # ── Legacy path: LLM user filter ──
+                        total_margin_used = sum(
+                            p.get("margin_used", 0) for p in existing_positions
+                        )
+                        lf_filter_prompt, _ = pm.get_user_filter_prompt(
+                            signal=signal,
+                            mission=mission_context,
+                            existing_positions=existing_positions,
+                            margin_used=total_margin_used,
+                            account_value=current_value,
+                        )
 
-                    # LLM filter for this user profile (with Langfuse trace)
-                    filter_result = await llm.filter_for_user(
-                        signal=signal,
-                        mission=mission_context,
-                        existing_positions=existing_positions,
-                        trace=trace,
-                        lf_prompt=lf_filter_prompt,
-                    )
+                        filter_result = await llm.filter_for_user(
+                            signal=signal,
+                            mission=mission_context,
+                            existing_positions=existing_positions,
+                            trace=trace,
+                            lf_prompt=lf_filter_prompt,
+                        )
 
-                    if not filter_result.get("should_execute", False):
-                        continue
+                        if not filter_result.get("should_execute", False):
+                            continue
 
-                    # Calculate position parameters
-                    adjusted_leverage = min(
-                        filter_result.get("adjusted_leverage", 1),
-                        mission_context["max_leverage"],
-                    )
-                    position_size_percent = filter_result.get("position_size_percent", 10)
+                        adjusted_leverage = min(
+                            filter_result.get("adjusted_leverage", 1),
+                            mission_context["max_leverage"],
+                        )
+                        position_size_percent = filter_result.get("position_size_percent", 10)
                     available_margin = account.get("withdrawable", 0)
                     position_margin = available_margin * (position_size_percent / 100)
                     market_price = market_state.market_data.get(asset, {}).get("price", 0)
@@ -596,8 +602,54 @@ class ExecutionWorkerPool:
                         stop_loss = market_price * (1 + sl_pct / 100)
                         take_profit = market_price * (1 - tp_pct / 100)
 
+                    # ── Fast Actor path: create Playbook, skip trade execution ──
+                    if settings.fast_actor_enabled:
+                        from app.models.playbook import Playbook, PlaybookStatus, PLAYBOOKS_PENDING_KEY
+
+                        entry_band = settings.fast_actor_entry_band_pct / 100
+                        pb = Playbook(
+                            playbook_id=uuid.uuid4().hex,
+                            cycle_id=cycle_id,
+                            mission_id=mission_id,
+                            asset=asset,
+                            direction=signal["direction"],
+                            position_size=position_size,
+                            leverage=adjusted_leverage,
+                            margin_allocated=position_margin,
+                            entry_price=market_price,
+                            entry_zone_min=market_price * (1 - entry_band),
+                            entry_zone_max=market_price * (1 + entry_band),
+                            max_slippage_pct=settings.fast_actor_max_slippage_pct,
+                            stop_loss_price=stop_loss,
+                            take_profit_price=take_profit,
+                            trailing_activation_pct=risk_profile["trailing_activation_pct"],
+                            trailing_callback_pct=risk_profile["trailing_callback_pct"],
+                            conviction=signal.get("confidence", "MEDIUM"),
+                            strategy_tag=signal.get("strategy", ""),
+                            reasoning=signal.get("reasoning", ""),
+                            ttl_seconds=settings.playbook_ttl_seconds,
+                        )
+
+                        pipe = self._redis.pipeline()
+                        pipe.set(pb.redis_key, pb.to_json(), ex=pb.ttl_seconds + 3600)
+                        pipe.sadd(PLAYBOOKS_PENDING_KEY, pb.playbook_id)
+                        await pipe.execute()
+
+                        orders_executed += 1
+                        logger.info(
+                            "Playbook created for Fast Actor",
+                            playbook_id=pb.playbook_id,
+                            mission_id=mission_id,
+                            asset=asset,
+                            direction=signal["direction"],
+                            entry_zone=f"[{pb.entry_zone_min:.2f}, {pb.entry_zone_max:.2f}]",
+                            sl=stop_loss,
+                            tp=take_profit,
+                        )
+                        continue
+
                     # Rate limiting is handled at the client level (HyperliquidRateLimiter)
-                    # Execute trade
+                    # Execute trade (legacy path)
                     if settings.dry_run:
                         # DRY RUN: log but don't submit
                         logger.info(

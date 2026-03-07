@@ -149,6 +149,33 @@ class Settings(BaseSettings):
         description="Max reconnect delay in seconds for WS",
     )
 
+    # Fast Actor (deterministic execution engine)
+    fast_actor_enabled: bool = Field(
+        default=False,
+        alias="FAST_ACTOR_ENABLED",
+        description="Enable Fast Actor for sub-second playbook execution",
+    )
+    fast_actor_max_slippage_pct: float = Field(
+        default=0.5,
+        alias="FAST_ACTOR_MAX_SLIPPAGE_PCT",
+        description="Max slippage % for Fast Actor entries",
+    )
+    playbook_ttl_seconds: int = Field(
+        default=900,
+        alias="PLAYBOOK_TTL_SECONDS",
+        description="How long a playbook stays valid for entry (default: 15 min)",
+    )
+    fast_actor_use_ioc_exits: bool = Field(
+        default=True,
+        alias="FAST_ACTOR_USE_IOC_EXITS",
+        description="Use IOC orders for exits (immediate fill)",
+    )
+    fast_actor_entry_band_pct: float = Field(
+        default=0.3,
+        alias="FAST_ACTOR_ENTRY_BAND_PCT",
+        description="Entry zone width % around ideal price",
+    )
+
     # PnL Fan-Out
     pnl_fanout_batch_size: int = Field(
         default=5,

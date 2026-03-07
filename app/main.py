@@ -155,6 +155,25 @@ async def lifespan(app: FastAPI):
             await ws_feed.start()
             app.state.ws_feed = ws_feed
             logger.info("WebSocket market data feed started")
+
+            # Start Fast Actor if enabled (requires WS feed)
+            app.state.fast_actor = None
+            if settings.fast_actor_enabled:
+                from app.services.fast_actor import FastActor
+
+                fast_actor = FastActor(ws_redis)
+                await fast_actor.start()
+                app.state.fast_actor = fast_actor
+
+                # Extend WS callback to also feed the Fast Actor
+                original_callback = on_ws_prices
+
+                async def on_ws_prices_with_fast_actor(mids: dict):
+                    await original_callback(mids)
+                    await fast_actor.on_price_tick(mids)
+
+                ws_feed._on_prices_update = on_ws_prices_with_fast_actor
+                logger.info("Fast Actor started and wired to WebSocket feed")
         else:
             logger.info("WebSocket feed disabled (WS_ENABLED=false)")
 
@@ -196,6 +215,11 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "scheduler") and app.state.scheduler:
         await app.state.scheduler.stop()
         logger.info("Scheduler stopped")
+
+    # Stop Fast Actor (before WS feed)
+    if hasattr(app.state, "fast_actor") and app.state.fast_actor:
+        await app.state.fast_actor.stop()
+        logger.info("Fast Actor stopped")
 
     # Stop WebSocket feed
     if hasattr(app.state, "ws_feed") and app.state.ws_feed:

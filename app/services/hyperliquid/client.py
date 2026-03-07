@@ -788,8 +788,11 @@ class HyperliquidClient:
 
         # Convert price and size to Hyperliquid's fixed-point format
         # Hyperliquid uses 8 decimal places for prices, variable for sizes
-        if price is None or order_type == "market":
-            # Market order - use 0 as price indicator
+        if order_type == "market" and price is not None:
+            # IOC market-like order: set worst-case price with 1% slippage
+            slippage_mult = 1.01 if is_buy else 0.99
+            limit_px = int(price * slippage_mult * 1e8)
+        elif price is None:
             limit_px = 0
         else:
             # Convert to integer with 8 decimal places
@@ -1184,13 +1187,22 @@ class HyperliquidClient:
             orders = message.get("orders", [])
             hl_orders = []
             for order in orders:
+                # Respect orderType for time-in-force
+                order_type_int = order.get("orderType", 0)
+                if order_type_int == 1:
+                    tif_obj = {"limit": {"tif": "Ioc"}}  # IOC (market-like)
+                elif order_type_int == 2:
+                    tif_obj = {"limit": {"tif": "Alo"}}  # Add-Liquidity-Only
+                else:
+                    tif_obj = {"limit": {"tif": "Gtc"}}  # Default GTC
+
                 hl_orders.append({
                     "a": order["asset"],
                     "b": order["isBuy"],
                     "p": str(order["limitPx"]),
                     "s": str(order["sz"]),
-                    "r": order["reduceOnly"],
-                    "t": {"limit": {"tif": "Gtc"}},  # Default to GTC
+                    "r": order.get("reduceOnly", False),
+                    "t": tif_obj,
                 })
 
             action = {
