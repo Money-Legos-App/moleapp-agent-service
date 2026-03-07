@@ -1,4 +1,4 @@
-# Alkebulan Agent Service Dockerfile
+# Alkebulan Agent Service Dockerfile (Standalone — Render deploy)
 # Python 3.11 with FastAPI, FAISS, LangGraph
 
 FROM python:3.11-slim
@@ -17,16 +17,15 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --no-cache-dir uv
 
 # Copy dependency files first for better caching
-# Note: Context is backend/ directory, so paths are relative to that
-COPY agent-service/pyproject.toml ./
-COPY agent-service/README.md ./
+COPY pyproject.toml ./
+COPY README.md ./
 
 # Install dependencies using UV
 RUN uv pip install --system -e . --no-cache
 
 # Copy application code
-COPY agent-service/app ./app
-COPY agent-service/data_pipeline ./data_pipeline
+COPY app ./app
+COPY data_pipeline ./data_pipeline
 
 # Create data directories
 RUN mkdir -p /app/data/faiss_index /app/data/raw
@@ -35,12 +34,12 @@ RUN mkdir -p /app/data/faiss_index /app/data/raw
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Expose port
-EXPOSE 3006
+# Expose port (Render private services default to 10000)
+EXPOSE 10000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget -q -O - http://localhost:3006/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD wget -q -O - http://localhost:10000/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "3006"]
+# Run the application (Render dockerCommand overrides this)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000"]
