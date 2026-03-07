@@ -363,8 +363,8 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         # Legacy field (kept for backwards compat)
                         "time_horizon": signal_response.get("time_horizon", "3d"),
                         "rag_context_ids": [p.get("id") for p in patterns] if patterns else [],
-                        "max_drawdown_30d": risk.get("max_drawdown_30d"),
-                        "volatility_score": risk.get("volatility_30d"),
+                        "max_drawdown_30d": risk.get("max_drawdown_30d") if risk else None,
+                        "volatility_score": risk.get("volatility_30d") if risk else None,
                         "generated_at": datetime.utcnow().isoformat(),
                     }
 
