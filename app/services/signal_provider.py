@@ -4,13 +4,14 @@ Signal Provider (The Brain)
 Runs once per trading cycle to produce a MarketState:
 - Fetches market data from Hyperliquid
 - Queries FAISS for pattern context (optional)
-- Calls DeepSeek LLM once to generate signals
+- Calls DeepSeek LLM concurrently for all assets
 - Stores the resulting MarketState in Redis
 
 This is the "One Brain" in the "One Brain, Many Hands" architecture.
 The Execution Fleet (dispatcher + workers) consumes the MarketState.
 """
 
+import asyncio
 import json
 import time
 from datetime import datetime
@@ -21,6 +22,9 @@ import structlog
 from app.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+# Max concurrent LLM calls to avoid rate-limiting
+MAX_CONCURRENT_ANALYSES = 5
 
 
 class MarketState:
@@ -136,17 +140,34 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
     risk_metrics: Dict[str, Dict[str, Any]] = {}
     errors: List[str] = []
 
+    # Fetch ALL market data in 1 metaAndAssetCtxs call + N concurrent L2 calls
+    # instead of 2N calls (1 meta + 1 L2 per asset sequentially)
     try:
-        for asset in settings.allowed_assets:
+        market_data = await hl_client.get_bulk_market_data(settings.allowed_assets)
+    except Exception as e:
+        logger.error("Failed to fetch bulk market data", error=str(e))
+        errors.append(f"Bulk market data fetch failed: {str(e)}")
+        await hl_client.close()
+        await llm.close()
+        return MarketState(
+            cycle_id=cycle_id,
+            triggered_at=datetime.utcnow().isoformat(),
+            signals=[], market_data={}, risk_metrics={}, errors=errors,
+        )
+
+    # Semaphore to limit concurrent DeepSeek API calls
+    sem = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
+
+    async def _analyze_asset(asset: str) -> Optional[Dict[str, Any]]:
+        """Analyze a single asset. Returns a signal dict or None."""
+        async with sem:
             try:
-                # Fetch market data
-                data = await hl_client.get_market_data(asset)
-                market_data[asset] = data
+                data = market_data.get(asset, {})
 
                 current_price = data.get("price", 0)
                 if current_price == 0:
                     logger.warning("No price data for asset", asset=asset)
-                    continue
+                    return None
 
                 # Query FAISS for patterns (wrapped in Langfuse span)
                 patterns = []
@@ -220,8 +241,6 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
 
                 if signal_response.get("should_trade", False):
                     # ── Funding Trap Filter (hard-coded safety net) ──
-                    # LLMs can hallucinate; math does not.
-                    # 0.0005 = 0.05% per hour ≈ 44% APR — extreme carry cost.
                     HIGH_FUNDING_THRESHOLD = 0.0005
                     funding = data.get("funding_rate", 0)
                     direction = signal_response.get("direction")
@@ -236,7 +255,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                             confidence=confidence,
                             reason="LONG against high positive funding, confidence not HIGH",
                         )
-                        continue
+                        return None
 
                     if direction == "SHORT" and funding < -HIGH_FUNDING_THRESHOLD and confidence != "HIGH":
                         logger.info(
@@ -247,7 +266,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                             confidence=confidence,
                             reason="SHORT against high negative funding, confidence not HIGH",
                         )
-                        continue
+                        return None
 
                     signal = {
                         "asset": asset,
@@ -268,7 +287,6 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         "volatility_score": risk.get("volatility_30d"),
                         "generated_at": datetime.utcnow().isoformat(),
                     }
-                    signals.append(signal)
 
                     # Persist signal to DB for backtesting and API
                     try:
@@ -285,16 +303,31 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         direction=signal["direction"],
                         confidence=signal["confidence"],
                     )
+                    return signal
                 else:
                     logger.info(
                         "No trade signal",
                         asset=asset,
                         reason=signal_response.get("reasoning", ""),
                     )
+                    return None
 
             except Exception as e:
                 logger.error("Error analyzing asset", asset=asset, error=str(e))
                 errors.append(f"Market analysis error for {asset}: {str(e)}")
+                return None
+
+    try:
+        # Run all asset analyses concurrently (bounded by semaphore)
+        results = await asyncio.gather(
+            *[_analyze_asset(asset) for asset in settings.allowed_assets],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                errors.append(f"Unexpected analysis error: {str(result)}")
+            elif result is not None:
+                signals.append(result)
 
     finally:
         await hl_client.close()

@@ -72,6 +72,12 @@ CORRELATION_BUCKETS = {
     "SOL-USD": "uncorrelated",
     "XRP-USD": "uncorrelated",
     "ADA-USD": "uncorrelated",
+    "DOGE-USD": "btc_correlated",
+    "LINK-USD": "uncorrelated",
+    "AVAX-USD": "uncorrelated",
+    "SUI-USD": "uncorrelated",
+    "WIF-USD": "uncorrelated",
+    "PEPE-USD": "uncorrelated",
 }
 
 # Default caps (overridden by settings at runtime)
@@ -150,6 +156,12 @@ MAINTENANCE_MARGIN_RATIOS = {
     "OP-USD": 0.05,
     "XRP-USD": 0.05,
     "ADA-USD": 0.05,
+    "DOGE-USD": 0.05,
+    "LINK-USD": 0.05,
+    "AVAX-USD": 0.05,
+    "SUI-USD": 0.05,
+    "WIF-USD": 0.10,
+    "PEPE-USD": 0.10,
 }
 DEFAULT_MAINTENANCE_MARGIN = 0.05
 

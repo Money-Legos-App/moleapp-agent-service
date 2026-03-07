@@ -220,7 +220,7 @@ class Settings(BaseSettings):
     # Trading constraints
     # Note: stored as comma-separated string to avoid pydantic-settings JSON parsing
     allowed_assets_str: str = Field(
-        default="ETH-USD,BTC-USD",
+        default="ETH-USD,BTC-USD,SOL-USD,XRP-USD,DOGE-USD,LINK-USD,AVAX-USD,ARB-USD,OP-USD,ADA-USD,SUI-USD,WIF-USD,PEPE-USD",
         alias="ALLOWED_ASSETS",
     )
     max_leverage_conservative: int = 1
@@ -481,6 +481,17 @@ class HyperliquidConfig:
     ASSET_DECIMALS = {
         "ETH-USD": 18,
         "BTC-USD": 8,
+        "SOL-USD": 9,
+        "XRP-USD": 6,
+        "DOGE-USD": 8,
+        "LINK-USD": 18,
+        "AVAX-USD": 18,
+        "ARB-USD": 18,
+        "OP-USD": 18,
+        "ADA-USD": 6,
+        "SUI-USD": 9,
+        "WIF-USD": 6,
+        "PEPE-USD": 18,
     }
 
     @classmethod

@@ -286,6 +286,87 @@ class HyperliquidClient:
             "max_leverage": asset_info.get("maxLeverage", 50) if asset_info else 50,
         }
 
+    async def get_bulk_market_data(self, assets: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Get market data for multiple assets efficiently.
+
+        Fetches metaAndAssetCtxs once (1 API call), then L2 books
+        concurrently (N calls). Total: 1 + N instead of 2N.
+        """
+        # 1) Single call for all universe + context data
+        meta_and_ctxs = await self._info_request("metaAndAssetCtxs")
+        meta = meta_and_ctxs[0] if len(meta_and_ctxs) > 0 else {}
+        asset_ctxs = meta_and_ctxs[1] if len(meta_and_ctxs) > 1 else []
+        universe = meta.get("universe", [])
+
+        # Build coin -> index lookup
+        coin_index = {u["name"]: i for i, u in enumerate(universe)}
+        self._asset_index_cache = coin_index
+
+        # 2) Fetch L2 books concurrently for all requested assets
+        async def _get_l2(coin: str):
+            return coin, await self._info_request("l2Book", {"coin": coin})
+
+        coins = [a.replace("-USD", "") for a in assets]
+        l2_results = await asyncio.gather(
+            *[_get_l2(c) for c in coins],
+            return_exceptions=True,
+        )
+        l2_map = {}
+        for result in l2_results:
+            if isinstance(result, tuple):
+                l2_map[result[0]] = result[1]
+
+        # 3) Assemble per-asset data
+        results: Dict[str, Dict[str, Any]] = {}
+        for asset in assets:
+            coin = asset.replace("-USD", "")
+            idx = coin_index.get(coin)
+
+            asset_info = universe[idx] if idx is not None and idx < len(universe) else None
+            asset_ctx = asset_ctxs[idx] if idx is not None and idx < len(asset_ctxs) else None
+
+            if not asset_info:
+                logger.warning("Asset not found in Hyperliquid universe", asset=asset)
+
+            if asset_ctx:
+                mark_price = float(asset_ctx.get("markPx", 0))
+                funding_rate = float(asset_ctx.get("funding", 0))
+                open_interest = float(asset_ctx.get("openInterest", 0))
+                volume_24h = float(asset_ctx.get("dayNtlVlm", 0))
+                prev_day_px = float(asset_ctx.get("prevDayPx", 0))
+            else:
+                mark_price = 0
+                funding_rate = 0
+                open_interest = 0
+                volume_24h = 0
+                prev_day_px = 0
+
+            price_change_24h = ((mark_price - prev_day_px) / prev_day_px * 100) if prev_day_px else 0
+
+            l2_data = l2_map.get(coin, {})
+            bids = l2_data.get("levels", [[]])[0]
+            asks = l2_data.get("levels", [[], []])[1]
+            best_bid = float(bids[0]["px"]) if bids else mark_price * 0.999
+            best_ask = float(asks[0]["px"]) if asks else mark_price * 1.001
+            spread = (best_ask - best_bid) / mark_price * 100 if mark_price else 0
+
+            results[asset] = {
+                "asset": asset,
+                "price": mark_price,
+                "mark_price": mark_price,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "volume_24h": volume_24h,
+                "price_change_24h": price_change_24h,
+                "funding_rate": funding_rate,
+                "open_interest": open_interest,
+                "max_leverage": asset_info.get("maxLeverage", 50) if asset_info else 50,
+            }
+
+        return results
+
     async def get_funding_rate(self, asset: str) -> float:
         """Get the current funding rate for an asset (hourly, raw decimal)."""
         coin = asset.replace("-USD", "")
