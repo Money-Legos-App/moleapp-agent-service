@@ -7,10 +7,12 @@ Phase 3 of the 4-Pillar Architecture:
 1. Halt & Flatten — revoke agent access, close all positions
 2. Read Final Balance — get account value from Hyperliquid
 3. Withdrawal — SDK withdraw_from_bridge() → USDC back to Arbitrum
+3b. Wait for Settlement — poll Arbitrum USDC balance until withdrawal lands
 4. Fee Collection & Payout — locally-signed Arbitrum TXs for fee + user return
-5. Clean Up — mark Vault key as destroyed (logical flag, not irreversible)
+5. Clean Up — NULL encrypted key ONLY after confirming Master EOA balance is zero
 """
 
+import asyncio
 from decimal import Decimal
 from typing import Dict, Any, Optional
 
@@ -27,6 +29,11 @@ logger = structlog.get_logger(__name__)
 # Hyperliquid API URLs
 HL_MAINNET_API = "https://api.hyperliquid.xyz"
 HL_TESTNET_API = "https://api.hyperliquid-testnet.xyz"
+
+# Settlement polling config
+SETTLEMENT_POLL_INTERVAL = 15  # seconds between balance checks
+SETTLEMENT_MAX_WAIT = 600  # 10 minutes max wait for HL bridge settlement
+SETTLEMENT_MIN_POLLS = 3  # minimum number of polls before giving up
 
 
 async def complete_mission(
@@ -117,15 +124,49 @@ async def complete_mission(
                 amount=str(final_balance),
             )
 
+        # ─── Phase 3b: Wait for HL Bridge Settlement ──────────
+        # HL bridge withdrawals are ASYNC — USDC arrives on Arbitrum after
+        # ~2-5 minutes. We MUST wait for funds to land before executing
+        # the fee split, otherwise the Arbitrum TXs will fail.
+        if result["withdrawal_initiated"]:
+            result["phase"] = "awaiting_settlement"
+            settled_balance = await _wait_for_settlement(
+                bridge_signer=bridge_signer,
+                master_eoa_address=master_eoa,
+                expected_amount=final_balance,
+                mission_id=mission_id,
+            )
+
+            if settled_balance is None:
+                raise RuntimeError(
+                    f"HL withdrawal did not settle within {SETTLEMENT_MAX_WAIT}s. "
+                    f"Funds may still be in transit. Key preserved for manual recovery."
+                )
+
+            logger.info(
+                "HL withdrawal settled on Arbitrum",
+                mission_id=mission_id,
+                settled_usdc=str(settled_balance),
+            )
+
         # ─── Phase 4: Fee Split on Arbitrum ──────────────────
         result["phase"] = "fee_split"
         from app.config import get_settings
         settings = get_settings()
 
+        # Use fee percent locked at mission creation time (DB column),
+        # falling back to current env var only for legacy missions
+        locked_fee_percent = mission_data.get("feePercent")
+        fee_percent = (
+            float(locked_fee_percent)
+            if locked_fee_percent is not None
+            else settings.profit_fee_percent
+        )
+
         split = calculate_fee_split(
             initial_capital=initial_capital,
             final_balance=final_balance,
-            fee_percent=settings.profit_fee_percent,
+            fee_percent=fee_percent,
         )
 
         if final_balance > 0 and user_wallet and encrypted_key:
@@ -138,29 +179,50 @@ async def complete_mission(
                 user_wallet_address=user_wallet,
                 initial_capital=initial_capital,
                 final_balance=final_balance,
-                fee_percent=settings.profit_fee_percent,
+                fee_percent=fee_percent,
             )
             result["fee_split_completed"] = True
             result["fee_tx_hash"] = fee_result.get("fee_tx_hash")
             result["payout_tx_hash"] = fee_result.get("payout_tx_hash")
 
-        # ─── Phase 5: Mark Key as Destroyed ──────────────────
+        # ─── Phase 5: Finalize — NULL key ONLY after confirming balance is zero ──
         result["phase"] = "finalizing"
 
-        # Destroy encrypted key — NULL ciphertext, keep address for audit
         from app.services.database import update_mission_status
+
+        # Verify Master EOA USDC balance is zero before destroying key
+        # This prevents irrecoverable fund loss if payout TX failed silently
+        eoa_balance_zero = await _verify_eoa_balance_zero(
+            bridge_signer=bridge_signer,
+            master_eoa_address=master_eoa,
+        )
+
+        extra_fields = {
+            "finalBalance": str(final_balance),
+            "protocolFee": str(split["fee"]),
+            "userPayout": str(split["user_payout"]),
+        }
+
+        if eoa_balance_zero:
+            # Safe to NULL the key — no funds remain
+            extra_fields["vaultKeyDestroyed"] = True
+            extra_fields["masterEoaKeyEnc"] = None
+            result["vault_key_destroyed"] = True
+        else:
+            # Funds still on Master EOA — preserve key for manual recovery
+            logger.warning(
+                "Master EOA still has USDC balance — preserving encrypted key",
+                mission_id=mission_id,
+                master_eoa=master_eoa,
+            )
+            extra_fields["vaultKeyDestroyed"] = False
+            result["vault_key_destroyed"] = False
+
         await update_mission_status(
             mission_id=mission_id,
             new_status="COMPLETED",
-            extra_fields={
-                "vaultKeyDestroyed": True,
-                "masterEoaKeyEnc": None,
-                "finalBalance": str(final_balance),
-                "protocolFee": str(split["fee"]),
-                "userPayout": str(split["user_payout"]),
-            },
+            extra_fields=extra_fields,
         )
-        result["vault_key_destroyed"] = True
 
         # Also update via wallet_bridge for status sync
         await wallet_bridge.update_mission_status(
@@ -171,7 +233,8 @@ async def complete_mission(
                 "protocolFee": str(split["fee"]),
                 "userPayout": str(split["user_payout"]),
                 "hadProfit": split["had_profit"],
-                "feePercent": settings.profit_fee_percent,
+                "feePercent": fee_percent,
+                "keyPreserved": not eoa_balance_zero,
             },
         )
 
@@ -373,3 +436,110 @@ async def _withdraw_from_hyperliquid(
             del exchange
         except NameError:
             pass
+
+
+async def _wait_for_settlement(
+    bridge_signer: ArbitrumBridgeSigner,
+    master_eoa_address: str,
+    expected_amount: Decimal,
+    mission_id: str,
+) -> Optional[Decimal]:
+    """
+    Poll the Master EOA's USDC balance on Arbitrum until the HL bridge
+    withdrawal lands.
+
+    HL bridge withdrawals typically settle in 2-5 minutes. We poll every
+    SETTLEMENT_POLL_INTERVAL seconds, up to SETTLEMENT_MAX_WAIT seconds.
+
+    Returns:
+        The USDC balance on Arbitrum (Decimal) if settlement detected, else None.
+    """
+    from eth_utils import to_checksum_address
+
+    master = to_checksum_address(master_eoa_address)
+    usdc_contract = bridge_signer.usdc
+
+    # Read initial USDC balance before withdrawal arrives
+    initial_balance = usdc_contract.functions.balanceOf(master).call()
+
+    # We expect at least ~90% of the HL balance to arrive (some dust may remain)
+    # Using 6 decimals for USDC
+    expected_atomic = int(expected_amount * Decimal(10 ** 6))
+    threshold = initial_balance + int(expected_atomic * 0.90)
+
+    elapsed = 0
+    polls = 0
+
+    logger.info(
+        "Waiting for HL bridge settlement",
+        mission_id=mission_id,
+        initial_usdc_balance=initial_balance,
+        expected_atomic=expected_atomic,
+        threshold=threshold,
+    )
+
+    while elapsed < SETTLEMENT_MAX_WAIT:
+        await asyncio.sleep(SETTLEMENT_POLL_INTERVAL)
+        elapsed += SETTLEMENT_POLL_INTERVAL
+        polls += 1
+
+        current_balance = usdc_contract.functions.balanceOf(master).call()
+
+        logger.debug(
+            "Settlement poll",
+            mission_id=mission_id,
+            poll=polls,
+            current_balance=current_balance,
+            threshold=threshold,
+            elapsed_seconds=elapsed,
+        )
+
+        if current_balance >= threshold:
+            settled_amount = Decimal(current_balance - initial_balance) / Decimal(10 ** 6)
+            logger.info(
+                "Bridge settlement detected",
+                mission_id=mission_id,
+                settled_usdc=str(settled_amount),
+                polls=polls,
+                elapsed_seconds=elapsed,
+            )
+            return settled_amount
+
+    logger.error(
+        "Bridge settlement timeout",
+        mission_id=mission_id,
+        elapsed_seconds=elapsed,
+        polls=polls,
+        last_balance=current_balance if polls > 0 else initial_balance,
+    )
+    return None
+
+
+async def _verify_eoa_balance_zero(
+    bridge_signer: ArbitrumBridgeSigner,
+    master_eoa_address: str,
+) -> bool:
+    """
+    Check that the Master EOA has no remaining USDC on Arbitrum.
+
+    Only returns True if balance is zero (or dust < 0.01 USDC).
+    This is the safety gate before NULLing the encrypted key.
+    """
+    from eth_utils import to_checksum_address
+
+    master = to_checksum_address(master_eoa_address)
+    usdc_balance = bridge_signer.usdc.functions.balanceOf(master).call()
+
+    # Allow up to 0.01 USDC dust (10000 atomic units)
+    DUST_THRESHOLD = 10_000
+
+    if usdc_balance <= DUST_THRESHOLD:
+        return True
+
+    logger.warning(
+        "Master EOA still has USDC",
+        master_eoa=master,
+        usdc_balance_atomic=usdc_balance,
+        usdc_balance=float(usdc_balance) / 1e6,
+    )
+    return False

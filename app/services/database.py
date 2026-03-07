@@ -1191,6 +1191,7 @@ async def get_mission_by_id(mission_id: str, user_id: Optional[str] = None) -> O
                 m."masterEoaKeyEnc" as master_eoa_key_enc,
                 m."vaultKeyCreated" as vault_key_created,
                 m."vaultKeyDestroyed" as vault_key_destroyed,
+                m."feePercent" as fee_percent,
                 t.address as user_wallet_address,
                 (SELECT ka.address FROM kernel_accounts ka
                  WHERE ka."walletId" = m."walletId" LIMIT 1) as kernel_account_address
@@ -1254,6 +1255,7 @@ async def get_mission_by_id(mission_id: str, user_id: Optional[str] = None) -> O
             "master_eoa_key_enc": getattr(row, "master_eoa_key_enc", None),
             "vault_key_created": getattr(row, "vault_key_created", False),
             "vault_key_destroyed": getattr(row, "vault_key_destroyed", False),
+            "feePercent": getattr(row, "fee_percent", 30.0),
             "created_at": row.created_at,
         }
 
@@ -1321,6 +1323,7 @@ _ALLOWED_EXTRA_FIELDS = frozenset({
     "userPayout", "pausedAt", "completedAt", "startedAt", "endsAt",
     "hyperliquidApproved", "feeCollectedAt", "payoutCompletedAt",
     "masterEoaKeyEnc", "agentPrivateKeyEnc", "agentAddress",
+    "feePercent",
 })
 
 
