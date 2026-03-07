@@ -143,6 +143,7 @@ class TurnkeyBridge:
         mission_type: str,
         deposit_amount: str,
         wallet_id: str,
+        risk_level: str = "MODERATE",
     ) -> Dict[str, Any]:
         """
         Create a new agent mission.
@@ -152,6 +153,7 @@ class TurnkeyBridge:
             mission_type: "SHORT_TERM_30D" or "LONG_TERM_45D"
             deposit_amount: Initial deposit in USDC
             wallet_id: User's wallet ID
+            risk_level: "CONSERVATIVE", "MODERATE", or "AGGRESSIVE"
 
         Returns:
             Mission creation result including mission ID and user wallet address
@@ -164,6 +166,7 @@ class TurnkeyBridge:
                 "missionType": mission_type,
                 "depositAmount": deposit_amount,
                 "walletId": wallet_id,
+                "riskLevel": risk_level,
             },
         )
 

@@ -177,6 +177,7 @@ async def create_mission(
             mission_type=request.strategy,
             deposit_amount=request.initial_capital,
             wallet_id=request.wallet_id,
+            risk_level=request.risk_level,
         )
         await bridge.close()
 
