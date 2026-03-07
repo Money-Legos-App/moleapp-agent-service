@@ -357,6 +357,15 @@ class HyperliquidClient:
             best_ask = float(asks[0]["px"]) if asks else mark_price * 1.001
             spread = (best_ask - best_bid) / mark_price * 100 if mark_price else 0
 
+            # Orderbook depth imbalance (first 5 levels)
+            bid_depth = sum(float(b.get("sz", 0)) for b in bids[:5])
+            ask_depth = sum(float(a.get("sz", 0)) for a in asks[:5])
+            total_depth = bid_depth + ask_depth
+            if total_depth > 0:
+                bid_imbalance = round((bid_depth - ask_depth) / total_depth * 100, 1)
+            else:
+                bid_imbalance = 0.0
+
             results[asset] = {
                 "asset": asset,
                 "price": mark_price,
@@ -368,10 +377,179 @@ class HyperliquidClient:
                 "price_change_24h": price_change_24h,
                 "funding_rate": funding_rate,
                 "open_interest": open_interest,
+                "bid_imbalance_pct": bid_imbalance,
                 "max_leverage": asset_info.get("maxLeverage", 50) if asset_info else 50,
             }
 
         return results
+
+    async def get_candle_data(
+        self, coin: str, interval: str = "1h", lookback: int = 50
+    ) -> List[Dict[str, float]]:
+        """
+        Fetch OHLCV candle data from Hyperliquid.
+
+        Args:
+            coin: Asset symbol without suffix (e.g., "ETH")
+            interval: Candle interval ("15m", "1h", "4h", "1d")
+            lookback: Number of candles to fetch
+
+        Returns:
+            List of dicts: [{open, high, low, close, volume, time}, ...]
+        """
+        import time as _time
+
+        now_ms = int(_time.time() * 1000)
+        # Map interval string to milliseconds for startTime calculation
+        interval_ms = {
+            "15m": 15 * 60 * 1000,
+            "1h": 3600 * 1000,
+            "4h": 4 * 3600 * 1000,
+            "1d": 24 * 3600 * 1000,
+        }
+        ms = interval_ms.get(interval, 3600 * 1000)
+        start_ms = now_ms - (lookback * ms)
+
+        data = await self._info_request("candleSnapshot", {
+            "coin": coin,
+            "interval": interval,
+            "startTime": start_ms,
+            "endTime": now_ms,
+        })
+
+        candles = []
+        for c in data:
+            candles.append({
+                "open": float(c.get("o", 0)),
+                "high": float(c.get("h", 0)),
+                "low": float(c.get("l", 0)),
+                "close": float(c.get("c", 0)),
+                "volume": float(c.get("v", 0)),
+                "time": c.get("t", 0),
+            })
+        return candles
+
+    @staticmethod
+    def compute_technical_summary(candles: List[Dict[str, float]], interval: str) -> Dict[str, Any]:
+        """
+        Compute key technical indicators from candle data.
+        All math is done in Python — the LLM receives pre-computed summaries.
+
+        Returns:
+            Dict with RSI-14, EMA-20/50 trend, ATR-14, and volume profile.
+        """
+        if len(candles) < 20:
+            return {"interval": interval, "available": False}
+
+        closes = [c["close"] for c in candles]
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        # RSI-14
+        rsi = 50.0
+        if len(closes) >= 15:
+            gains, losses = [], []
+            for i in range(1, min(15, len(closes))):
+                delta = closes[-i] - closes[-i - 1]
+                gains.append(max(delta, 0))
+                losses.append(max(-delta, 0))
+            avg_gain = sum(gains) / len(gains) if gains else 0
+            avg_loss = sum(losses) / len(losses) if losses else 0
+            if avg_loss > 0:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            elif avg_gain > 0:
+                rsi = 100.0
+
+        # EMA helper
+        def _ema(data, period):
+            if len(data) < period:
+                return sum(data) / len(data) if data else 0
+            k = 2 / (period + 1)
+            ema_val = sum(data[:period]) / period
+            for price in data[period:]:
+                ema_val = price * k + ema_val * (1 - k)
+            return ema_val
+
+        ema_20 = _ema(closes, 20)
+        ema_50 = _ema(closes, min(50, len(closes)))
+        current_price = closes[-1]
+
+        if ema_20 > ema_50 * 1.002:
+            trend = "bullish"
+        elif ema_20 < ema_50 * 0.998:
+            trend = "bearish"
+        else:
+            trend = "neutral"
+
+        # ATR-14
+        true_ranges = []
+        for i in range(1, min(15, len(closes))):
+            tr = max(
+                highs[-i] - lows[-i],
+                abs(highs[-i] - closes[-i - 1]),
+                abs(lows[-i] - closes[-i - 1]),
+            )
+            true_ranges.append(tr)
+        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0
+        atr_pct = (atr / current_price * 100) if current_price > 0 else 0
+
+        # Volume profile: current vs average
+        avg_vol = sum(volumes) / len(volumes) if volumes else 0
+        recent_vol = sum(volumes[-3:]) / min(3, len(volumes)) if volumes else 0
+        vol_ratio = round(recent_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+        # RSI label
+        if rsi >= 70:
+            rsi_label = "overbought"
+        elif rsi <= 30:
+            rsi_label = "oversold"
+        else:
+            rsi_label = "neutral"
+
+        return {
+            "interval": interval,
+            "available": True,
+            "rsi": round(rsi, 1),
+            "rsi_label": rsi_label,
+            "trend": trend,
+            "ema_20": round(ema_20, 2),
+            "ema_50": round(ema_50, 2),
+            "atr_pct": round(atr_pct, 2),
+            "vol_ratio": vol_ratio,
+            "price": round(current_price, 2),
+        }
+
+    async def get_multi_timeframe_analysis(self, coin: str) -> str:
+        """
+        Fetch candles for 1h and 4h, compute indicators, return a formatted
+        summary string ready for LLM consumption.
+        """
+        timeframes = [("1h", 50), ("4h", 50)]
+
+        async def _fetch_tf(interval, lookback):
+            try:
+                candles = await self.get_candle_data(coin, interval, lookback)
+                return self.compute_technical_summary(candles, interval)
+            except Exception as e:
+                logger.warning("Candle fetch failed", coin=coin, interval=interval, error=str(e))
+                return {"interval": interval, "available": False}
+
+        results = await asyncio.gather(*[_fetch_tf(iv, lb) for iv, lb in timeframes])
+
+        lines = []
+        for r in results:
+            if not r.get("available"):
+                lines.append(f"- {r['interval']}: data unavailable")
+                continue
+            lines.append(
+                f"- {r['interval']}: RSI={r['rsi']} ({r['rsi_label']}), "
+                f"trend={r['trend']} (EMA20={r['ema_20']}, EMA50={r['ema_50']}), "
+                f"ATR={r['atr_pct']}%, vol={r['vol_ratio']}x avg"
+            )
+
+        return "\n".join(lines) if lines else "Multi-timeframe data unavailable."
 
     async def get_funding_rate(self, asset: str) -> float:
         """Get the current funding rate for an asset (hourly, raw decimal)."""

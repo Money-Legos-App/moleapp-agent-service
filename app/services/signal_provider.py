@@ -156,6 +156,66 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
             signals=[], market_data={}, risk_metrics={}, errors=errors,
         )
 
+    # Fetch multi-timeframe candle data + OI delta from Redis
+    from app.services.execution_queue import get_redis
+    try:
+        redis = await get_redis()
+    except Exception:
+        redis = None
+
+    # Multi-timeframe technical analysis (concurrent for all assets)
+    tf_summaries: Dict[str, str] = {}
+    try:
+        async def _get_tf(asset: str):
+            coin = asset.replace("-USD", "")
+            return asset, await hl_client.get_multi_timeframe_analysis(coin)
+
+        tf_results = await asyncio.gather(
+            *[_get_tf(a) for a in settings.allowed_assets],
+            return_exceptions=True,
+        )
+        for result in tf_results:
+            if isinstance(result, tuple):
+                tf_summaries[result[0]] = result[1]
+    except Exception as e:
+        logger.warning("Multi-timeframe fetch failed", error=str(e))
+
+    # OI delta + relative volume: compare current values against last cycle (Redis)
+    oi_deltas: Dict[str, Dict[str, Any]] = {}
+    for asset, data in market_data.items():
+        coin = asset.replace("-USD", "")
+        current_oi = data.get("open_interest", 0)
+        current_vol = data.get("volume_24h", 0)
+
+        delta_info: Dict[str, Any] = {"oi_change_pct": None, "vol_vs_avg": None}
+        if redis:
+            try:
+                prev_raw = await redis.hget("agent:market:prev_oi", coin)
+                prev_vol_raw = await redis.hget("agent:market:prev_vol_24h", coin)
+
+                if prev_raw:
+                    prev_oi = float(prev_raw)
+                    if prev_oi > 0:
+                        delta_info["oi_change_pct"] = round(
+                            (current_oi - prev_oi) / prev_oi * 100, 2
+                        )
+
+                if prev_vol_raw:
+                    prev_vol = float(prev_vol_raw)
+                    if prev_vol > 0:
+                        delta_info["vol_vs_avg"] = round(current_vol / prev_vol, 2)
+
+                # Store current values for next cycle
+                await redis.hset("agent:market:prev_oi", coin, str(current_oi))
+                await redis.hset("agent:market:prev_vol_24h", coin, str(current_vol))
+            except Exception:
+                pass
+
+        oi_deltas[asset] = delta_info
+        # Attach to market_data for downstream consumers
+        market_data[asset]["oi_change_pct"] = delta_info.get("oi_change_pct")
+        market_data[asset]["vol_vs_avg"] = delta_info.get("vol_vs_avg")
+
     # Semaphore to limit concurrent DeepSeek API calls
     sem = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
 
@@ -189,7 +249,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                     })
                     rag_span.end()
 
-                # Build pattern context
+                # Build pattern context — skip dead data when RAG is disabled
                 if patterns:
                     context_parts = []
                     for p in patterns:
@@ -203,14 +263,21 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         )
                     pattern_context = "\n\n".join(context_parts)
                 else:
-                    pattern_context = "No historical pattern data available."
+                    # When RAG is disabled, pass None to skip the section entirely
+                    pattern_context = None
 
                 # Risk context
                 if faiss_store is not None:
                     risk = await faiss_store.get_risk_context(asset)
                 else:
-                    risk = {"max_drawdown_30d": -0.20, "volatility_30d": 0.05, "sample_count": 0}
-                risk_metrics[asset] = risk
+                    risk = None  # Skip hardcoded dummy values when RAG is disabled
+                if risk:
+                    risk_metrics[asset] = risk
+
+                # Gather enrichment data for this asset
+                tf_summary = tf_summaries.get(asset)
+                oi_delta = oi_deltas.get(asset, {})
+                bid_imbalance = data.get("bid_imbalance_pct", 0)
 
                 # Fetch prompt from Langfuse (falls back to local PromptTemplates)
                 lf_prompt, _ = pm.get_market_analysis_prompt(
@@ -219,10 +286,13 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                     price_change_24h=data.get("price_change_24h", 0),
                     volume_24h=data.get("volume_24h", 0),
                     spread=data.get("spread", 0.01),
-                    pattern_context=pattern_context,
-                    risk_metrics=risk,
+                    pattern_context=pattern_context or "",
+                    risk_metrics=risk or {},
                     funding_rate=data.get("funding_rate", 0),
                     open_interest=data.get("open_interest", 0),
+                    tf_summary=tf_summary,
+                    oi_delta=oi_delta,
+                    bid_imbalance_pct=bid_imbalance,
                 )
 
                 # Call DeepSeek for analysis (with Langfuse trace)
@@ -236,6 +306,9 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                     risk_metrics=risk,
                     funding_rate=data.get("funding_rate", 0),
                     open_interest=data.get("open_interest", 0),
+                    tf_summary=tf_summary,
+                    oi_delta=oi_delta,
+                    bid_imbalance_pct=bid_imbalance,
                     trace=trace,
                     lf_prompt=lf_prompt,
                 )

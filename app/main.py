@@ -106,19 +106,30 @@ async def lifespan(app: FastAPI):
             app.state.scheduler = None
             logger.info("Scheduler disabled in development mode")
 
-        # Log operating mode clearly
+        # ── OPERATING MODE BANNER ──────────────────────────────────
         network = "MAINNET" if settings.hyperliquid_mainnet else "TESTNET"
-        if settings.dry_run:
+        mode = "PAPER TRADING" if settings.dry_run else "LIVE TRADING"
+        vault_ok = settings.vault_configured
+
+        if not settings.dry_run and settings.hyperliquid_mainnet:
+            logger.critical(
+                f"*** {mode} on {network} — REAL FUNDS AT RISK ***",
+                dry_run=False,
+                hyperliquid_api=HyperliquidConfig.get_api_url(True),
+                vault_configured=vault_ok,
+                scheduler_active=app.state.scheduler is not None,
+            )
+        elif settings.dry_run:
             logger.info(
-                f"PAPER TRADING MODE on {network}",
+                f"{mode} on {network}",
                 dry_run=True,
                 hyperliquid_api=HyperliquidConfig.get_api_url(settings.hyperliquid_mainnet),
                 scheduler_active=app.state.scheduler is not None,
                 allowed_assets=settings.allowed_assets,
             )
         else:
-            logger.info(
-                f"LIVE TRADING MODE on {network}",
+            logger.warning(
+                f"{mode} on {network}",
                 dry_run=False,
                 hyperliquid_api=HyperliquidConfig.get_api_url(settings.hyperliquid_mainnet),
                 scheduler_active=app.state.scheduler is not None,

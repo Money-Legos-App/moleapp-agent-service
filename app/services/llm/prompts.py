@@ -38,6 +38,12 @@ MARKET REGIME AWARENESS:
 - OI exploding + price stalling = distribution/accumulation (localized top/bottom)
 - Funding > 0.05% hourly + price flat = crowded trade, high risk of liquidation flush
 
+CONFIDENCE CALIBRATION:
+- HIGH: 3+ confirming factors across timeframes, no contradicting signals, clear trend alignment. Expected win rate >60%. Requires extraordinary evidence — do NOT default to HIGH.
+- MEDIUM: 2 confirming factors, mild headwinds acceptable, 50-60% expected win rate. This should be your most common confidence level.
+- LOW: Speculative, conflicting signals across timeframes, unclear edge. Use only when a strong macro trend overrides noisy shorter-term data.
+- When in doubt, default to MEDIUM. The system will adjust position sizing accordingly.
+
 You must respond in valid JSON format only. No text outside the JSON structure.
 """
 
@@ -50,6 +56,11 @@ You must respond in valid JSON format only. No text outside the JSON structure.
 - Bid/Ask Spread: {spread:.4f}%
 - Funding Rate: {funding_rate_hourly:.4f}% per hour ({funding_rate_apr:.1f}% APR)
 - Open Interest: ${open_interest:,.0f}
+{oi_delta_section}
+{orderbook_section}
+
+## Multi-Timeframe Technical Analysis
+{tf_analysis_section}
 
 ## Hyperliquid Exchange Mechanics
 This is a perpetual futures exchange. Key mechanics that affect your decisions:
@@ -58,22 +69,15 @@ This is a perpetual futures exchange. Key mechanics that affect your decisions:
 - When funding is extreme (>0.05%/hr), it often mean-reverts — crowded trades unwind.
 - There is no expiry on perps — positions can be held indefinitely, but funding accumulates.
 - Liquidation happens at the maintenance margin level. Higher leverage = closer liquidation.
-
-## Historical Pattern Context (from similar market conditions)
-{pattern_context}
-
-## Risk Metrics from Historical Patterns
-- Maximum Drawdown (30d): {max_drawdown_30d:.1f}%
-- Average Volatility (30d): {volatility_30d:.1f}%
-- Sample Size: {sample_count} patterns
-
+{pattern_section}
 ## Task
 Analyze the above data as a hedge fund CIO managing perpetual futures on Hyperliquid. Consider:
-1. Is there a clear directional edge? If not, the answer is no trade.
+1. Is there a clear directional edge across timeframes? If the 1h and 4h trends conflict, the answer is usually no trade.
 2. Funding cost analysis: Calculate the hourly funding bleed for your direction. How many hours can you hold before funding erodes your edge? If funding is a tailwind, factor that into your profit target.
-3. Open Interest analysis: Is OI increasing (new money entering = conviction) or decreasing (positions unwinding = weakening trend)?
-4. What is the risk/reward ratio? Only proceed if reward >= 2x risk.
-5. What would invalidate this trade thesis?
+3. Open Interest analysis: Is OI increasing (new money entering = conviction) or decreasing (positions unwinding = weakening trend)? Use the OI change data if available.
+4. Orderbook imbalance: Does the depth favor your direction? Strong bid imbalance supports longs, strong ask imbalance supports shorts.
+5. What is the risk/reward ratio? Only proceed if reward >= 2x risk.
+6. What would invalidate this trade thesis?
 
 Respond with the following JSON structure:
 
@@ -141,8 +145,9 @@ If conditions are not favorable for trading, set should_trade to false and expla
 {existing_positions}
 
 ## Portfolio Context
-- Capital Deployed: {capital_deployed_percent:.0f}% of total capital is currently in positions
+- Capital Deployed: {capital_deployed_percent:.1f}% of total capital is currently in margin
 - Number of Open Positions: {open_position_count}
+{correlation_section}
 
 ## Task
 As a portfolio manager, determine if this trade fits the client's mandate. Consider:
@@ -156,7 +161,7 @@ As a portfolio manager, determine if this trade fits the client's mandate. Consi
 2. Portfolio Concentration:
    - Never deploy more than 50% of capital across all positions
    - Single position should not exceed 25% of capital
-   - Consider correlation with existing positions
+   - Check correlation group: avoid adding to the same bucket if already exposed
 
 3. Position Sizing (Kelly-inspired):
    - Size = (edge / odds) * capital, capped by risk level
@@ -245,8 +250,11 @@ Respond with:
         risk_metrics: Dict[str, Any],
         funding_rate: float = 0.0,
         open_interest: float = 0.0,
+        tf_summary: str = None,
+        oi_delta: Dict[str, Any] = None,
+        bid_imbalance_pct: float = 0.0,
     ) -> str:
-        """Format the market analysis prompt."""
+        """Format the market analysis prompt with enriched market context."""
         # HL funding is a raw hourly decimal (e.g., 0.0001 = 0.01% per hour)
         funding_rate_hourly = funding_rate * 100  # Convert to percentage
         funding_rate_apr = funding_rate * 100 * 8760  # Annualized (365 * 24 hours)
@@ -261,6 +269,51 @@ Respond with:
         else:
             formatted_price = f"{current_price:.8f}"
 
+        # Build OI delta section
+        oi_delta = oi_delta or {}
+        oi_parts = []
+        if oi_delta.get("oi_change_pct") is not None:
+            oi_parts.append(f"- OI Change (vs last cycle): {oi_delta['oi_change_pct']:+.2f}%")
+        if oi_delta.get("vol_vs_avg") is not None:
+            oi_parts.append(f"- Volume vs Previous Cycle: {oi_delta['vol_vs_avg']}x")
+        oi_delta_section = "\n".join(oi_parts)
+
+        # Build orderbook section
+        if bid_imbalance_pct != 0:
+            if bid_imbalance_pct > 20:
+                ob_label = "strong bid support"
+            elif bid_imbalance_pct > 5:
+                ob_label = "mild bid support"
+            elif bid_imbalance_pct < -20:
+                ob_label = "strong ask pressure"
+            elif bid_imbalance_pct < -5:
+                ob_label = "mild ask pressure"
+            else:
+                ob_label = "balanced"
+            orderbook_section = f"- Orderbook Imbalance (5-level): {bid_imbalance_pct:+.1f}% ({ob_label})"
+        else:
+            orderbook_section = ""
+
+        # Build multi-timeframe section
+        if tf_summary:
+            tf_analysis_section = tf_summary
+        else:
+            tf_analysis_section = "Multi-timeframe data unavailable for this cycle."
+
+        # Build pattern section — omit entirely when RAG is disabled (no dummy data)
+        if pattern_context:
+            pattern_section = f"""
+## Historical Pattern Context (from similar market conditions)
+{pattern_context}
+
+## Risk Metrics from Historical Patterns
+- Maximum Drawdown (30d): {(risk_metrics or {}).get('max_drawdown_30d', -0.20) * 100:.1f}%
+- Average Volatility (30d): {(risk_metrics or {}).get('volatility_30d', 0.05) * 100:.1f}%
+- Sample Size: {(risk_metrics or {}).get('sample_count', 0)} patterns
+"""
+        else:
+            pattern_section = ""
+
         return cls.MARKET_ANALYSIS_PROMPT.format(
             asset=asset,
             current_price=formatted_price,
@@ -270,10 +323,10 @@ Respond with:
             funding_rate_hourly=funding_rate_hourly,
             funding_rate_apr=funding_rate_apr,
             open_interest=open_interest,
-            pattern_context=pattern_context,
-            max_drawdown_30d=risk_metrics.get("max_drawdown_30d", -20) * 100,
-            volatility_30d=risk_metrics.get("volatility_30d", 5) * 100,
-            sample_count=risk_metrics.get("sample_count", 0),
+            oi_delta_section=oi_delta_section,
+            orderbook_section=orderbook_section,
+            tf_analysis_section=tf_analysis_section,
+            pattern_section=pattern_section,
         )
 
     @classmethod
@@ -282,17 +335,50 @@ Respond with:
         signal: Dict[str, Any],
         mission: Dict[str, Any],
         existing_positions: List[Dict[str, Any]],
+        margin_used: float = 0.0,
+        account_value: float = 0.0,
     ) -> str:
-        """Format the user filter prompt."""
+        """Format the user filter prompt with actual margin data and correlation info."""
         positions_str = "None" if not existing_positions else "\n".join([
             f"- {p['asset']}: {p['direction']} at {p['leverage']}x, PnL: {p['unrealized_pnl']:+.2f}%"
             for p in existing_positions
         ])
 
-        # Calculate portfolio deployment
         open_position_count = len(existing_positions)
-        # Approximate capital deployed based on position count (rough heuristic)
-        capital_deployed_percent = min(open_position_count * 15, 100)
+
+        # Use actual margin utilization from clearinghouse state
+        if account_value > 0 and margin_used > 0:
+            capital_deployed_percent = (margin_used / account_value) * 100
+        elif open_position_count > 0:
+            # Fallback: estimate from margin_used fields on positions
+            total_margin = sum(p.get("margin_used", 0) for p in existing_positions)
+            current_val = mission.get("current_value", 0)
+            if current_val > 0 and total_margin > 0:
+                capital_deployed_percent = (total_margin / current_val) * 100
+            else:
+                capital_deployed_percent = open_position_count * 15.0
+        else:
+            capital_deployed_percent = 0.0
+
+        # Build correlation section
+        from app.services.risk_manager import CORRELATION_BUCKETS
+        asset_name = signal.get("asset", "")
+        target_bucket = CORRELATION_BUCKETS.get(asset_name, "uncorrelated")
+        same_bucket_positions = [
+            p["asset"] for p in existing_positions
+            if CORRELATION_BUCKETS.get(p["asset"], "uncorrelated") == target_bucket
+        ]
+        if same_bucket_positions:
+            correlation_section = (
+                f"- Correlation Group: {asset_name} is in '{target_bucket}' bucket. "
+                f"Existing positions in same group: {', '.join(same_bucket_positions)}. "
+                f"Adding another correlated position increases concentration risk."
+            )
+        else:
+            correlation_section = (
+                f"- Correlation Group: {asset_name} is in '{target_bucket}' bucket. "
+                f"No existing positions in this group — diversification benefit."
+            )
 
         return cls.USER_FILTER_PROMPT.format(
             asset=signal.get("asset"),
@@ -314,6 +400,7 @@ Respond with:
             existing_positions=positions_str,
             capital_deployed_percent=capital_deployed_percent,
             open_position_count=open_position_count,
+            correlation_section=correlation_section,
         )
 
     @classmethod

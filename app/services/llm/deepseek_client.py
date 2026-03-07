@@ -207,10 +207,13 @@ class DeepSeekClient:
         price_change_24h: float,
         volume_24h: float,
         spread: float,
-        pattern_context: str,
-        risk_metrics: Dict[str, Any],
+        pattern_context: Optional[str] = None,
+        risk_metrics: Optional[Dict[str, Any]] = None,
         funding_rate: float = 0.0,
         open_interest: float = 0.0,
+        tf_summary: Optional[str] = None,
+        oi_delta: Optional[Dict[str, Any]] = None,
+        bid_imbalance_pct: float = 0.0,
         # Langfuse instrumentation
         trace=None,
         lf_prompt=None,
@@ -224,10 +227,13 @@ class DeepSeekClient:
             price_change_24h: 24-hour price change percentage
             volume_24h: 24-hour trading volume
             spread: Bid-ask spread percentage
-            pattern_context: Context from similar historical patterns
-            risk_metrics: Risk metrics from FAISS patterns
+            pattern_context: Context from similar historical patterns (None if RAG disabled)
+            risk_metrics: Risk metrics from FAISS patterns (None if RAG disabled)
             funding_rate: Current funding rate (hourly, raw)
             open_interest: Current open interest in USD
+            tf_summary: Multi-timeframe technical analysis string
+            oi_delta: OI change and volume delta vs previous cycle
+            bid_imbalance_pct: Orderbook bid/ask imbalance percentage
 
         Returns:
             Trading signal dictionary
@@ -238,10 +244,13 @@ class DeepSeekClient:
             price_change_24h=price_change_24h,
             volume_24h=volume_24h,
             spread=spread,
-            pattern_context=pattern_context,
-            risk_metrics=risk_metrics,
+            pattern_context=pattern_context or "",
+            risk_metrics=risk_metrics or {},
             funding_rate=funding_rate,
             open_interest=open_interest,
+            tf_summary=tf_summary,
+            oi_delta=oi_delta,
+            bid_imbalance_pct=bid_imbalance_pct,
         )
 
         messages = [

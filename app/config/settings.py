@@ -473,9 +473,7 @@ class HyperliquidConfig:
     TESTNET_WS = "wss://api.hyperliquid-testnet.xyz/ws"
     MAINNET_WS = "wss://api.hyperliquid.xyz/ws"
 
-    # Contract addresses for agent approval
-    TESTNET_EXCHANGE = "0x..."  # TODO: Add actual testnet address
-    MAINNET_EXCHANGE = "0x..."  # TODO: Add actual mainnet address
+    # Agent approval uses SDK Exchange.approve_agent() — no contract addresses needed
 
     # Asset mappings
     ASSET_DECIMALS = {

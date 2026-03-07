@@ -506,10 +506,16 @@ class ExecutionWorkerPool:
                         continue
 
                     # Fetch user filter prompt from Langfuse (fallback to local)
+                    # Pass actual margin utilization from clearinghouse state
+                    total_margin_used = sum(
+                        p.get("margin_used", 0) for p in existing_positions
+                    )
                     lf_filter_prompt, _ = pm.get_user_filter_prompt(
                         signal=signal,
                         mission=mission_context,
                         existing_positions=existing_positions,
+                        margin_used=total_margin_used,
+                        account_value=current_value,
                     )
 
                     # LLM filter for this user profile (with Langfuse trace)

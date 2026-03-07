@@ -1327,6 +1327,54 @@ _ALLOWED_EXTRA_FIELDS = frozenset({
 })
 
 
+async def get_stuck_completing_missions(stuck_minutes: int = 30) -> List[Dict[str, Any]]:
+    """Fetch missions stuck in COMPLETING status for longer than stuck_minutes.
+
+    These missions had their exit flow interrupted (settlement timeout, fee split
+    error, etc.) and need retry. Returns full mission data needed by complete_mission().
+    """
+    async with get_db() as db:
+        query = text("""
+            SELECT
+                m.id,
+                m."userId" as user_id,
+                m."walletId" as wallet_id,
+                m."initialCapital" as initial_capital,
+                m."riskLevel" as risk_level,
+                m."feePercent" as fee_percent,
+                m."masterEoaAddress" as master_eoa_address,
+                m."masterEoaKeyEnc" as master_eoa_key_enc,
+                m."agentPrivateKeyEnc" as agent_private_key_enc,
+                t.address as user_wallet_address,
+                m."updatedAt" as updated_at
+            FROM agent_missions m
+            LEFT JOIN turnkey_signers t ON m."turnkeySignerId" = t.id
+            WHERE m.status = 'COMPLETING'
+            AND m."updatedAt" < NOW() - INTERVAL :interval
+            ORDER BY m."updatedAt" ASC
+        """)
+
+        result = await db.execute(query, {"interval": f"{stuck_minutes} minutes"})
+        rows = result.fetchall()
+
+        missions = []
+        for row in rows:
+            missions.append({
+                "id": row.id,
+                "user_id": row.user_id,
+                "wallet_id": row.wallet_id,
+                "initial_capital": float(row.initial_capital) if row.initial_capital else 0,
+                "risk_level": row.risk_level,
+                "feePercent": float(row.fee_percent) if row.fee_percent else None,
+                "master_eoa_address": row.master_eoa_address or "",
+                "master_eoa_key_enc": row.master_eoa_key_enc or "",
+                "agent_private_key_enc": row.agent_private_key_enc or "",
+                "user_wallet_address": row.user_wallet_address or "",
+            })
+
+        return missions
+
+
 async def update_mission_status(
     mission_id: str,
     new_status: str,

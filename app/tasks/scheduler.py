@@ -107,6 +107,16 @@ class AgentScheduler:
             replace_existing=True,
         )
 
+        # Stuck Mission Recovery (retry missions stuck in COMPLETING for >30 min)
+        self._scheduler.add_job(
+            self._run_stuck_mission_recovery,
+            trigger=IntervalTrigger(minutes=15),
+            id="stuck_mission_recovery",
+            name="Stuck Mission Recovery",
+            max_instances=1,
+            replace_existing=True,
+        )
+
         # Deposit checks are event-driven (enqueued on mission activation via arq)
         # — no cron polling needed
 
@@ -296,6 +306,77 @@ class AgentScheduler:
 
         except Exception as e:
             logger.error("Backup risk monitor failed", error=str(e))
+
+    async def _run_stuck_mission_recovery(self) -> None:
+        """
+        Recover missions stuck in COMPLETING status for >30 minutes.
+
+        If a mission exit fails mid-flow (e.g., settlement timeout, fee split error),
+        the mission stays in COMPLETING forever with funds potentially stranded on the
+        Master EOA. This task retries the exit flow for such missions.
+        """
+        try:
+            from app.services.database import get_stuck_completing_missions, get_db
+            from app.services.mission_exit import complete_mission
+            from app.services.vault.client import VaultEncryptionService
+            from app.services.vault.bridge_signer import ArbitrumBridgeSigner
+            from app.services.hyperliquid import HyperliquidClient
+            from app.services.wallet import TurnkeyBridge
+
+            stuck_missions = await get_stuck_completing_missions(stuck_minutes=30)
+
+            if not stuck_missions:
+                return
+
+            logger.warning(
+                "Found stuck COMPLETING missions — retrying exit flow",
+                count=len(stuck_missions),
+                mission_ids=[m["id"] for m in stuck_missions],
+            )
+
+            vault = VaultEncryptionService()
+            bridge_signer = ArbitrumBridgeSigner()
+            hl_client = HyperliquidClient()
+            wallet_bridge = TurnkeyBridge()
+
+            for mission in stuck_missions:
+                try:
+                    result = await complete_mission(
+                        mission_id=mission["id"],
+                        user_id=mission["user_id"],
+                        vault=vault,
+                        bridge_signer=bridge_signer,
+                        hl_client=hl_client,
+                        wallet_bridge=wallet_bridge,
+                        mission_data=mission,
+                        is_mainnet=self.settings.hyperliquid_mainnet,
+                    )
+
+                    if result.get("error"):
+                        logger.error(
+                            "Stuck mission recovery failed",
+                            mission_id=mission["id"],
+                            phase=result.get("phase"),
+                            error=result["error"],
+                        )
+                    else:
+                        logger.info(
+                            "Stuck mission recovered successfully",
+                            mission_id=mission["id"],
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        "Stuck mission recovery exception",
+                        mission_id=mission["id"],
+                        error=str(e),
+                    )
+
+            await hl_client.close()
+            await wallet_bridge.close()
+
+        except Exception as e:
+            logger.error("Stuck mission recovery task failed", error=str(e))
 
     def get_job_status(self) -> dict:
         """Get status of all scheduled jobs."""
