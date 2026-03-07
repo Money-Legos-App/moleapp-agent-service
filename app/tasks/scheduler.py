@@ -157,6 +157,9 @@ class AgentScheduler:
         self._scheduler.start()
         self._is_running = True
 
+        # Warm candle cache immediately so the first trading cycle has data
+        asyncio.create_task(self._run_candle_refresh())
+
         logger.info(
             "Scheduler started",
             jobs=[job.id for job in self._scheduler.get_jobs()],
