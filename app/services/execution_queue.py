@@ -351,7 +351,7 @@ class ExecutionWorkerPool:
         # Langfuse: per-mission trace linked to the cycle session
         lf = get_langfuse()
         pm = get_prompt_manager()
-        trace = lf.trace(
+        trace = lf.start_trace(
             name="trading-cycle-filter",
             session_id=cycle_id,
             user_id=user_id,
@@ -497,7 +497,8 @@ class ExecutionWorkerPool:
                             reason=pre_filter,
                         )
                         # Langfuse: record pre-filter rejection
-                        trace.event(
+                        lf.log_event(
+                            trace,
                             name="pre-filter-rejected",
                             input={"asset": asset, "direction": signal.get("direction")},
                             output={"reason": pre_filter},
@@ -697,13 +698,12 @@ class ExecutionWorkerPool:
                     output={
                         "orders_executed": orders_executed,
                         "orders_failed": orders_failed,
-                    },
-                    metadata={
                         "mission_id": mission_id,
                         "cycle_id": cycle_id,
                         "dry_run": settings.dry_run,
                     },
                 )
+                trace.end()
 
                 if orders_executed > 0:
                     await circuit_breaker.record_success(mission_id)

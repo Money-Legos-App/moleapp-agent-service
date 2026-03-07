@@ -116,16 +116,19 @@ class DeepSeekClient:
         generation = None
         if trace is not None:
             try:
-                gen_kwargs = dict(
-                    name=generation_name,
+                from app.services.observability.langfuse_client import get_langfuse
+                lf = get_langfuse()
+                generation = lf.start_generation(trace, name=generation_name)
+                gen_update = dict(
                     model=self.model,
-                    model_parameters={"temperature": temperature, "max_tokens": max_tokens},
                     input=messages,
                     metadata=generation_metadata or {},
                 )
+                gen_update["metadata"]["temperature"] = temperature
+                gen_update["metadata"]["max_tokens"] = max_tokens
                 if lf_prompt is not None:
-                    gen_kwargs["prompt"] = lf_prompt
-                generation = trace.generation(**gen_kwargs)
+                    gen_update["metadata"]["prompt_name"] = getattr(lf_prompt, "name", str(lf_prompt))
+                generation.update(**gen_update)
             except Exception:
                 generation = None
 
@@ -160,12 +163,14 @@ class DeepSeekClient:
                 prompt_tokens = self._last_usage.get("prompt_tokens", 0)
                 completion_tokens = self._last_usage.get("completion_tokens", 0)
 
-                generation.end(
+                generation.update(
                     output=content,
-                    usage={
+                    usage_details={
                         "input": prompt_tokens,
                         "output": completion_tokens,
                         "total": self._last_usage.get("total_tokens", 0),
+                    },
+                    metadata={
                         "input_cost": prompt_tokens * settings.deepseek_cost_per_input_token,
                         "output_cost": completion_tokens * settings.deepseek_cost_per_output_token,
                         "total_cost": (
@@ -174,6 +179,7 @@ class DeepSeekClient:
                         ),
                     },
                 )
+                generation.end()
             except Exception:
                 pass
 

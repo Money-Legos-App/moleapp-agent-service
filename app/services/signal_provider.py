@@ -109,7 +109,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
     # Langfuse: root trace for the brain cycle
     lf = get_langfuse()
     pm = get_prompt_manager()
-    trace = lf.trace(
+    trace = lf.start_trace(
         name="trading-cycle-brain",
         session_id=cycle_id,
         tags=[trigger_type, settings.environment],
@@ -158,17 +158,14 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                         f"Volume: ${data.get('volume_24h', 0):,.0f}, "
                         f"Funding rate: {data.get('funding_rate', 0):.4f}%"
                     )
-                    rag_span = trace.span(
-                        name=f"rag-retrieval-{asset}",
-                        input={"query": query, "asset": asset, "k": 5},
-                    )
+                    rag_span = lf.start_span(trace, name=f"rag-retrieval-{asset}")
+                    rag_span.update(input={"query": query, "asset": asset, "k": 5})
                     patterns = await faiss_store.search(query=query, k=5, filters={"asset": asset})
-                    rag_span.end(
-                        output={
-                            "pattern_count": len(patterns),
-                            "pattern_ids": [p.get("id") for p in patterns],
-                        },
-                    )
+                    rag_span.update(output={
+                        "pattern_count": len(patterns),
+                        "pattern_ids": [p.get("id") for p in patterns],
+                    })
+                    rag_span.end()
 
                 # Build pattern context
                 if patterns:
@@ -319,12 +316,10 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
             "signals_count": len(signals),
             "assets_analyzed": len(market_data),
             "errors_count": len(errors),
-        },
-        metadata={
             "duration_seconds": round(duration, 2),
-            "errors": errors,
         },
     )
+    trace.end()
 
     return MarketState(
         cycle_id=cycle_id,
