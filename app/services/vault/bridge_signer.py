@@ -200,7 +200,7 @@ class ArbitrumBridgeSigner:
         await self.fund_gas(master)
 
         # Step 2: USDC.approve(HL_BRIDGE, amount)
-        approve_tx_hash = await self._sign_and_send(
+        approve_result = await self._sign_and_send(
             encrypted_master_key=encrypted_master_key,
             master_eoa=master,
             contract_call=self.usdc.functions.approve(
@@ -208,16 +208,23 @@ class ArbitrumBridgeSigner:
             ),
         )
 
-        logger.info("USDC approve TX sent", tx_hash=approve_tx_hash)
+        if not approve_result["success"]:
+            raise RuntimeError(f"USDC approve TX reverted: {approve_result['tx_hash']}")
+
+        logger.info("USDC approve TX confirmed", tx_hash=approve_result["tx_hash"])
 
         # Step 3: HLBridge.sendUsd(masterEoa, amount)
-        bridge_tx_hash = await self._sign_and_send(
+        # Use next nonce (approve TX already confirmed, so chain nonce is incremented)
+        bridge_result = await self._sign_and_send(
             encrypted_master_key=encrypted_master_key,
             master_eoa=master,
             contract_call=self.hl_bridge.functions.sendUsd(master, usdc_amount),
         )
 
-        logger.info("Bridge TX sent", tx_hash=bridge_tx_hash)
+        if not bridge_result["success"]:
+            raise RuntimeError(f"Bridge TX reverted: {bridge_result['tx_hash']}")
+
+        logger.info("Bridge TX confirmed", tx_hash=bridge_result["tx_hash"])
 
         # Audit: record bridge operation
         try:
@@ -228,8 +235,8 @@ class ArbitrumBridgeSigner:
                 metadata={
                     "master_eoa": master,
                     "usdc_amount": usdc_amount,
-                    "approve_tx": approve_tx_hash,
-                    "bridge_tx": bridge_tx_hash,
+                    "approve_tx": approve_result["tx_hash"],
+                    "bridge_tx": bridge_result["tx_hash"],
                 },
                 success=True,
             )
@@ -237,8 +244,8 @@ class ArbitrumBridgeSigner:
             pass
 
         return {
-            "approve_tx": approve_tx_hash,
-            "bridge_tx": bridge_tx_hash,
+            "approve_tx": approve_result["tx_hash"],
+            "bridge_tx": bridge_result["tx_hash"],
             "success": True,
         }
 
@@ -248,20 +255,25 @@ class ArbitrumBridgeSigner:
         master_eoa_address: str,
         to_address: str,
         usdc_amount: int,
-    ) -> str:
+        nonce_override: int = None,
+    ) -> dict:
         """
         Transfer USDC from Master EOA to any address on Arbitrum.
         Used for fee collection (→ Treasury) and user payout (→ ZeroDev wallet).
+
+        Returns:
+            { tx_hash, nonce, success }
         """
         master = to_checksum_address(master_eoa_address)
         to = to_checksum_address(to_address)
 
         await self.fund_gas(master)
 
-        tx_hash = await self._sign_and_send(
+        result = await self._sign_and_send(
             encrypted_master_key=encrypted_master_key,
             master_eoa=master,
             contract_call=self.usdc.functions.transfer(to, usdc_amount),
+            nonce_override=nonce_override,
         )
 
         logger.info(
@@ -269,31 +281,37 @@ class ArbitrumBridgeSigner:
             from_addr=master,
             to_addr=to,
             amount=usdc_amount,
-            tx_hash=tx_hash,
+            tx_hash=result["tx_hash"],
+            success=result["success"],
         )
 
-        return tx_hash
+        return result
 
     async def _sign_and_send(
         self,
         encrypted_master_key: str,
         master_eoa: str,
         contract_call,
-    ) -> str:
+        nonce_override: int = None,
+    ) -> dict:
         """
-        Decrypt key → sign locally → broadcast.
+        Decrypt key → sign locally → broadcast → wait for receipt.
 
         1. Decrypt Master EOA key from Vault (JIT)
         2. Build unsigned TX from contract call
         3. Sign locally with eth_account
         4. Broadcast the signed TX
-        5. Delete raw key from memory
+        5. Wait for receipt and verify success
+        6. Delete raw key from memory
+
+        Returns:
+            { tx_hash, nonce, success, receipt }
         """
         raw_key = await self.vault.decrypt_private_key(encrypted_master_key)
         try:
             account = Account.from_key(raw_key)
 
-            nonce = self.w3.eth.get_transaction_count(master_eoa)
+            nonce = nonce_override if nonce_override is not None else self.w3.eth.get_transaction_count(master_eoa)
             tx = contract_call.build_transaction({
                 "from": master_eoa,
                 "nonce": nonce,
@@ -305,7 +323,23 @@ class ArbitrumBridgeSigner:
             signed = account.sign_transaction(tx)
             tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
-            return tx_hash.hex()
+            # Wait for receipt and verify TX succeeded on-chain
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            success = receipt.status == 1
+
+            if not success:
+                logger.error(
+                    "TX reverted on-chain",
+                    tx_hash=tx_hash.hex(),
+                    nonce=nonce,
+                    gas_used=receipt.gasUsed,
+                )
+
+            return {
+                "tx_hash": tx_hash.hex(),
+                "nonce": nonce,
+                "success": success,
+            }
         finally:
             del raw_key
             try:

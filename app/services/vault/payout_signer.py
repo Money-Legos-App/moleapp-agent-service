@@ -2,8 +2,11 @@
 Payout Signer
 
 Handles the exit fee split on Arbitrum after USDC is withdrawn from Hyperliquid:
-1. TX1: Master EOA → Platform Treasury (30% of profit, if any)
-2. TX2: Master EOA → User's ZeroDev Wallet (remaining balance)
+1. TX1: Master EOA → User's ZeroDev Wallet (user payout FIRST — user-funds-first policy)
+2. TX2: Master EOA → Platform Treasury (fee, only if payout succeeded)
+
+User payout executes before fee collection so that on partial failure,
+the user keeps their funds and only the platform loses its fee.
 
 Transactions are signed locally with the JIT-decrypted Master EOA key.
 """
@@ -86,10 +89,14 @@ async def execute_fee_split(
     """
     Execute the full fee split on Arbitrum after HL withdrawal.
 
-    Steps:
+    USER-FUNDS-FIRST policy:
     1. Calculate the 30% profit fee
-    2. TX1: Send fee to Platform Treasury (if profit > 0)
-    3. TX2: Send remaining balance to User's ZeroDev Wallet
+    2. TX1: Send user payout to ZeroDev Wallet FIRST (protects user funds)
+    3. TX2: Send fee to Platform Treasury ONLY if payout succeeded
+
+    If payout TX fails, fee TX is NOT attempted — user funds are prioritized.
+    Nonce management: TX1 receipt is confirmed before TX2 is sent to prevent
+    nonce collisions.
 
     Returns:
         { fee_amount, user_payout, fee_tx_hash, payout_tx_hash }
@@ -97,7 +104,7 @@ async def execute_fee_split(
     split = calculate_fee_split(initial_capital, final_balance, fee_percent)
 
     logger.info(
-        "Executing fee split",
+        "Executing fee split (user-funds-first)",
         mission_id=mission_id,
         initial_capital=str(initial_capital),
         final_balance=str(final_balance),
@@ -114,37 +121,62 @@ async def execute_fee_split(
         "payout_tx_hash": None,
     }
 
-    # TX1: Fee → Platform Treasury (only if there was profit)
-    if split["had_profit"] and split["fee"] > 0:
-        fee_atomic = to_usdc_atomic(split["fee"])
-        result["fee_tx_hash"] = await bridge_signer.transfer_usdc(
-            encrypted_master_key=encrypted_master_key,
-            master_eoa_address=master_eoa_address,
-            to_address=treasury_address,
-            usdc_amount=fee_atomic,
-        )
-        logger.info(
-            "Fee sent to treasury",
-            mission_id=mission_id,
-            fee=str(split["fee"]),
-            tx_hash=result["fee_tx_hash"],
-        )
-
-    # TX2: Payout → User's ZeroDev Wallet
+    # TX1: Payout → User's ZeroDev Wallet FIRST
     payout_atomic = to_usdc_atomic(split["user_payout"])
     if payout_atomic > 0:
-        result["payout_tx_hash"] = await bridge_signer.transfer_usdc(
+        payout_result = await bridge_signer.transfer_usdc(
             encrypted_master_key=encrypted_master_key,
             master_eoa_address=master_eoa_address,
             to_address=user_wallet_address,
             usdc_amount=payout_atomic,
         )
+        result["payout_tx_hash"] = payout_result["tx_hash"]
+
+        if not payout_result["success"]:
+            logger.error(
+                "User payout TX reverted — aborting fee collection to protect user funds",
+                mission_id=mission_id,
+                payout_tx_hash=payout_result["tx_hash"],
+            )
+            raise RuntimeError(
+                f"User payout TX reverted ({payout_result['tx_hash']}). "
+                f"Fee collection aborted. Funds remain on Master EOA for recovery."
+            )
+
         logger.info(
             "Payout sent to user",
             mission_id=mission_id,
             payout=str(split["user_payout"]),
-            tx_hash=result["payout_tx_hash"],
+            tx_hash=payout_result["tx_hash"],
         )
+
+    # TX2: Fee → Platform Treasury (only if profit AND payout succeeded)
+    # Receipt for TX1 is already confirmed (wait_for_transaction_receipt in
+    # _sign_and_send), so chain nonce is incremented — no nonce collision.
+    if split["had_profit"] and split["fee"] > 0:
+        fee_atomic = to_usdc_atomic(split["fee"])
+        fee_result = await bridge_signer.transfer_usdc(
+            encrypted_master_key=encrypted_master_key,
+            master_eoa_address=master_eoa_address,
+            to_address=treasury_address,
+            usdc_amount=fee_atomic,
+        )
+        result["fee_tx_hash"] = fee_result["tx_hash"]
+
+        if not fee_result["success"]:
+            # Fee TX failed but user already got their payout — acceptable loss
+            logger.warning(
+                "Fee TX reverted — user payout succeeded, platform fee lost",
+                mission_id=mission_id,
+                fee_tx_hash=fee_result["tx_hash"],
+            )
+        else:
+            logger.info(
+                "Fee sent to treasury",
+                mission_id=mission_id,
+                fee=str(split["fee"]),
+                tx_hash=fee_result["tx_hash"],
+            )
 
     logger.info("Fee split complete", mission_id=mission_id)
 

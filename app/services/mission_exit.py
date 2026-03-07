@@ -128,6 +128,7 @@ async def complete_mission(
         # HL bridge withdrawals are ASYNC — USDC arrives on Arbitrum after
         # ~2-5 minutes. We MUST wait for funds to land before executing
         # the fee split, otherwise the Arbitrum TXs will fail.
+        settled_balance = None
         if result["withdrawal_initiated"]:
             result["phase"] = "awaiting_settlement"
             settled_balance = await _wait_for_settlement(
@@ -163,13 +164,20 @@ async def complete_mission(
             else settings.profit_fee_percent
         )
 
+        # Use ACTUAL Arbitrum USDC balance for fee calc, not the HL L1 balance.
+        # Bridge fees / rounding may cause the settled amount to differ slightly.
+        if result["withdrawal_initiated"] and settled_balance is not None:
+            actual_balance = settled_balance
+        else:
+            actual_balance = final_balance
+
         split = calculate_fee_split(
             initial_capital=initial_capital,
-            final_balance=final_balance,
+            final_balance=actual_balance,
             fee_percent=fee_percent,
         )
 
-        if final_balance > 0 and user_wallet and encrypted_key:
+        if actual_balance > 0 and user_wallet and encrypted_key:
             fee_result = await execute_fee_split(
                 mission_id=mission_id,
                 bridge_signer=bridge_signer,
@@ -178,7 +186,7 @@ async def complete_mission(
                 treasury_address=settings.platform_treasury_address,
                 user_wallet_address=user_wallet,
                 initial_capital=initial_capital,
-                final_balance=final_balance,
+                final_balance=actual_balance,
                 fee_percent=fee_percent,
             )
             result["fee_split_completed"] = True
