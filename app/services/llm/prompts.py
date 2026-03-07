@@ -44,7 +44,7 @@ You must respond in valid JSON format only. No text outside the JSON structure.
     MARKET_ANALYSIS_PROMPT = """Analyze the current market conditions for {asset} and generate a trading signal.
 
 ## Current Market Data
-- Mark Price: ${current_price:,.2f}
+- Mark Price: ${current_price}
 - 24h Change: {price_change_24h:+.2f}%
 - 24h Volume: ${volume_24h:,.0f}
 - Bid/Ask Spread: {spread:.4f}%
@@ -228,9 +228,19 @@ Respond with:
         funding_rate_hourly = funding_rate * 100  # Convert to percentage
         funding_rate_apr = funding_rate * 100 * 8760  # Annualized (365 * 24 hours)
 
+        # Smart price formatting: adapt decimals to price magnitude
+        if current_price >= 1:
+            formatted_price = f"{current_price:,.2f}"
+        elif current_price >= 0.01:
+            formatted_price = f"{current_price:.4f}"
+        elif current_price >= 0.0001:
+            formatted_price = f"{current_price:.6f}"
+        else:
+            formatted_price = f"{current_price:.8f}"
+
         return cls.MARKET_ANALYSIS_PROMPT.format(
             asset=asset,
-            current_price=current_price,
+            current_price=formatted_price,
             price_change_24h=price_change_24h,
             volume_24h=volume_24h,
             spread=spread,

@@ -174,7 +174,7 @@ async def generate_market_state(trigger_type: str = "scheduled") -> MarketState:
                 if faiss_store is not None:
                     query = (
                         f"Current {asset} market conditions: "
-                        f"Price: ${current_price:,.2f}, "
+                        f"Price: ${current_price:g}, "
                         f"24h change: {data.get('price_change_24h', 0):+.2f}%, "
                         f"Volume: ${data.get('volume_24h', 0):,.0f}, "
                         f"Funding rate: {data.get('funding_rate', 0):.4f}%"
