@@ -28,6 +28,7 @@ dependencies = [
     # Hyperliquid & Trading
     "hyperliquid-python-sdk>=0.8.0",
     "ccxt>=4.0.0",
+    "web3>=6.0.0",
     "eth-account>=0.10.0",
     "msgpack>=1.0.0",
 
