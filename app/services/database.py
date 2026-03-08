@@ -248,7 +248,6 @@ async def get_active_missions() -> List[Dict[str, Any]]:
         List of mission dictionaries with wallet information
     """
     async with get_db() as db:
-        # Use raw SQL for the JOIN since models might not have relationships defined
         query = text("""
             SELECT
                 m.id,
@@ -286,7 +285,7 @@ async def get_active_missions() -> List[Dict[str, Any]]:
 
         missions = []
         for row in rows:
-            missions.append({
+            mission = {
                 "id": row.id,
                 "user_id": row.user_id,
                 "wallet_id": row.wallet_id,
@@ -310,7 +309,8 @@ async def get_active_missions() -> List[Dict[str, Any]]:
                 "turnkey_sub_org_id": row.turnkey_sub_org_id,
                 "turnkey_user_id": row.turnkey_user_id,
                 "user_wallet_address": row.user_wallet_address,
-            })
+            }
+            missions.append(mission)
 
         logger.info("Fetched active missions", count=len(missions))
         return missions
@@ -1415,11 +1415,12 @@ async def get_stuck_completing_missions(stuck_minutes: int = 30) -> List[Dict[st
             FROM agent_missions m
             LEFT JOIN turnkey_signers t ON m."turnkeySignerId" = t.id
             WHERE m.status = 'COMPLETING'
-            AND m."updatedAt" < NOW() - INTERVAL :interval
+            AND m."updatedAt" < :cutoff
             ORDER BY m."updatedAt" ASC
         """)
 
-        result = await db.execute(query, {"interval": f"{stuck_minutes} minutes"})
+        cutoff = datetime.utcnow() - timedelta(minutes=stuck_minutes)
+        result = await db.execute(query, {"cutoff": cutoff})
         rows = result.fetchall()
 
         missions = []
