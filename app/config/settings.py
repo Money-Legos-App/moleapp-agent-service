@@ -418,6 +418,22 @@ class Settings(BaseSettings):
         "At 1-3x leverage, profile SL wins; dynamic SL is a safety net for higher leverage.",
     )
 
+    # Minimum Notional (Hyperliquid rejects orders below ~$10 notional)
+    hl_min_notional_usd: float = Field(
+        default=10.0,
+        alias="HL_MIN_NOTIONAL_USD",
+        description="Minimum order notional in USD. HL rejects orders below this. "
+        "If a position is too small, the engine consolidates max_positions to 1 for that cycle.",
+    )
+
+    # Minimum Reward-to-Risk Ratio (hard kill switch — never trust LLM on R/R)
+    min_reward_risk_ratio: float = Field(
+        default=2.0,
+        alias="MIN_REWARD_RISK_RATIO",
+        description="Minimum TP%/SL% ratio. Orders with R/R below this are killed. "
+        "Protects against LLM recommending bad risk/reward setups.",
+    )
+
     # Slippage-Aware Position Sizing
     slippage_sizing_enabled: bool = Field(
         default=True,

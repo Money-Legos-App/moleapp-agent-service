@@ -49,8 +49,8 @@ RISK_PROFILES = {
         "max_margin_utilization": 0.50, # halt new entries above 50%
     },
     "AGGRESSIVE": {
-        "stop_loss_pct": 8.0,
-        "take_profit_pct": 20.0,
+        "stop_loss_pct": 7.0,
+        "take_profit_pct": 15.0,
         "trailing_activation_pct": 3.0,
         "trailing_callback_pct": 2.5,
         "max_drawdown_pct": 30.0,
@@ -409,11 +409,22 @@ def check_mission_drawdown(
     current_value: float,
     initial_capital: float,
     max_drawdown_pct: float,
+    peak_account_value: Optional[float] = None,
 ) -> bool:
-    """Check if mission-level drawdown exceeds kill switch threshold."""
-    if initial_capital <= 0:
+    """
+    Check if mission-level drawdown exceeds kill switch threshold.
+
+    Uses peak-to-trough (high-water mark) drawdown when peak_account_value
+    is available, falling back to initial_capital for legacy missions.
+
+    A user who grew $50 → $100 → $60 sees a 40% drawdown from peak,
+    not a 0% drawdown from initial capital. This protects realized gains.
+    """
+    # Use high-water mark if available, otherwise fall back to initial capital
+    reference_value = peak_account_value if peak_account_value and peak_account_value > 0 else initial_capital
+    if reference_value <= 0:
         return False
-    drawdown_pct = ((initial_capital - current_value) / initial_capital) * 100
+    drawdown_pct = ((reference_value - current_value) / reference_value) * 100
     return drawdown_pct > max_drawdown_pct
 
 
@@ -666,16 +677,19 @@ async def evaluate_mission_risk(
             )
             continue
 
-    # Mission-level drawdown kill switch
+    # Mission-level drawdown kill switch (peak-to-trough via high-water mark)
     kill_switch = False
+    peak_value = mission.get("peak_account_value") or initial_capital
     if initial_capital > 0 and account_value > 0:
-        if check_mission_drawdown(account_value, initial_capital, profile["max_drawdown_pct"]):
+        if check_mission_drawdown(account_value, initial_capital, profile["max_drawdown_pct"], peak_value):
             kill_switch = True
-            drawdown_pct = ((initial_capital - account_value) / initial_capital) * 100
+            reference = peak_value if peak_value > 0 else initial_capital
+            drawdown_pct = ((reference - account_value) / reference) * 100
             logger.error(
-                "RISK: MISSION DRAWDOWN KILL SWITCH",
+                "RISK: MISSION DRAWDOWN KILL SWITCH (peak-to-trough)",
                 mission_id=mission_id,
                 initial_capital=initial_capital,
+                peak_account_value=peak_value,
                 current_value=account_value,
                 drawdown_pct=round(drawdown_pct, 2),
                 threshold=profile["max_drawdown_pct"],

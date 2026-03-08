@@ -600,6 +600,46 @@ class ExecutionWorkerPool:
                     if position_size <= 0:
                         continue
 
+                    # ── FIDUCIARY GATE 1: Minimum Notional Check ──
+                    # Hyperliquid rejects orders below ~$10 notional.
+                    # Option B: Dynamically reduce max_positions to 1 for this run,
+                    # consolidating the full profile margin cap into a single trade.
+                    # Example: Conservative $50 → 25% margin = $12.50, which clears $10 min.
+                    notional_value = position_size * market_price
+                    if notional_value < settings.hl_min_notional_usd:
+                        from app.services.risk_manager import get_risk_profile as _get_rp
+                        _profile = _get_rp(mission_context.get("risk_level", "MODERATE"))
+                        max_margin_pct = _profile["max_margin_utilization"]
+
+                        # Consolidate: use the full profile margin cap in 1 position
+                        consolidated_margin = available_margin * max_margin_pct
+                        consolidated_size = (consolidated_margin * adjusted_leverage) / market_price
+                        consolidated_notional = consolidated_size * market_price
+
+                        if consolidated_notional >= settings.hl_min_notional_usd:
+                            logger.info(
+                                "Min notional: consolidated max_positions→1 to clear threshold",
+                                mission_id=mission_id,
+                                asset=asset,
+                                original_notional=round(notional_value, 2),
+                                consolidated_notional=round(consolidated_notional, 2),
+                                min_notional=settings.hl_min_notional_usd,
+                            )
+                            position_size = consolidated_size
+                            position_margin = consolidated_margin
+                            # Block further entries this cycle (effectively max_positions=1)
+                            margin_committed_this_cycle = available_margin
+                        else:
+                            logger.warning(
+                                "Min notional: insufficient funds even after consolidation, skipping",
+                                mission_id=mission_id,
+                                asset=asset,
+                                notional=round(consolidated_notional, 2),
+                                min_notional=settings.hl_min_notional_usd,
+                                available_margin=round(available_margin, 2),
+                            )
+                            continue
+
                     # Calculate SL/TP from user's risk profile (with dynamic SL scaling)
                     from app.services.risk_manager import get_risk_profile, calculate_dynamic_stop_loss_pct
                     risk_profile = get_risk_profile(mission_context.get("risk_level", "MODERATE"))
@@ -622,6 +662,24 @@ class ExecutionWorkerPool:
                     else:
                         stop_loss = market_price * (1 + sl_pct / 100)
                         take_profit = market_price * (1 - tp_pct / 100)
+
+                    # ── FIDUCIARY GATE 2: Programmatic R/R Kill Switch ──
+                    # Never trust the LLM on risk/reward. If TP%/SL% < 2.0,
+                    # the trade is mathematically unprofitable at any win rate < 67%.
+                    # This is a hard-coded "dumb" kill switch — no LLM override.
+                    if sl_pct > 0:
+                        rr_ratio = tp_pct / sl_pct
+                        if rr_ratio < settings.min_reward_risk_ratio:
+                            logger.error(
+                                "R/R GATE: Invalid reward/risk ratio — trade killed",
+                                mission_id=mission_id,
+                                asset=asset,
+                                tp_pct=tp_pct,
+                                sl_pct=sl_pct,
+                                rr_ratio=round(rr_ratio, 2),
+                                min_required=settings.min_reward_risk_ratio,
+                            )
+                            continue
 
                     # ── Fast Actor path: create Playbook, skip trade execution ──
                     if settings.fast_actor_enabled:
@@ -759,6 +817,37 @@ class ExecutionWorkerPool:
                                 take_profit=take_profit,
                                 risk_level=mission_context.get("risk_level"),
                             )
+
+                            # ── Native HL Bracket Orders (exchange-level TP/SL) ──
+                            # Place TP/SL as trigger orders on Hyperliquid's matching engine.
+                            # This provides millisecond execution — our polling monitor
+                            # (60s fast scan) serves as backup + DB state sync only.
+                            if not settings.dry_run:
+                                try:
+                                    bracket_result = await hl_client.place_trigger_orders(
+                                        asset=asset,
+                                        is_long=signal["direction"] == "LONG",
+                                        size=position_size,
+                                        tp_price=take_profit,
+                                        sl_price=stop_loss,
+                                        mission_id=mission_id,
+                                        wallet_bridge=wallet_bridge,
+                                    )
+                                    if not bracket_result.get("success"):
+                                        logger.warning(
+                                            "Native TP/SL bracket failed (polling backup active)",
+                                            position_id=position_id,
+                                            asset=asset,
+                                            error=bracket_result.get("error"),
+                                        )
+                                except Exception as bracket_err:
+                                    # Non-fatal: polling monitor is the safety net
+                                    logger.warning(
+                                        "TP/SL bracket placement exception (polling backup active)",
+                                        position_id=position_id,
+                                        error=str(bracket_err),
+                                    )
+
                         except Exception as persist_err:
                             logger.warning(
                                 "Failed to persist position",

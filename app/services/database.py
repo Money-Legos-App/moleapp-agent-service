@@ -104,6 +104,7 @@ class AgentMission(Base):
     totalTrades = Column(Integer, default=0)
     winRate = Column(Float, default=0)
     maxDrawdown = Column(Float, default=0)
+    peakAccountValue = Column(Numeric(20, 8), nullable=True)  # High-water mark
     createdAt = Column(DateTime, default=datetime.utcnow)
     updatedAt = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -269,6 +270,7 @@ async def get_active_missions() -> List[Dict[str, Any]]:
                 m."totalTrades" as total_trades,
                 m."winRate" as win_rate,
                 m."maxDrawdown" as max_drawdown,
+                m."peakAccountValue" as peak_account_value,
                 t."turnkeySubOrgId" as turnkey_sub_org_id,
                 t."turnkeyUserId" as turnkey_user_id,
                 t.address as user_wallet_address
@@ -304,6 +306,7 @@ async def get_active_missions() -> List[Dict[str, Any]]:
                 "total_trades": row.total_trades or 0,
                 "win_rate": row.win_rate or 0,
                 "max_drawdown": row.max_drawdown or 0,
+                "peak_account_value": float(row.peak_account_value) if row.peak_account_value else None,
                 "turnkey_sub_org_id": row.turnkey_sub_org_id,
                 "turnkey_user_id": row.turnkey_user_id,
                 "user_wallet_address": row.user_wallet_address,
@@ -486,23 +489,51 @@ async def update_mission_pnl(
     max_drawdown: Optional[float] = None,
 ) -> bool:
     """
-    Update a mission's current value and PnL metrics.
+    Update a mission's current value, PnL metrics, and high-water mark.
+
+    The high-water mark (peakAccountValue) is updated atomically using
+    GREATEST(current, previous_peak). The maxDrawdown is recalculated
+    from peak-to-trough, not from initial capital.
 
     Args:
         mission_id: Mission ID
         current_value: Current total value
         total_pnl: Total PnL
-        max_drawdown: Max drawdown percentage (optional)
+        max_drawdown: Max drawdown percentage (optional, overridden by peak-to-trough)
 
     Returns:
         True if update was successful
     """
     async with get_db() as db:
+        # Atomically update high-water mark and calculate peak-to-trough drawdown
         query = text("""
             UPDATE agent_missions
             SET "currentValue" = :current_value,
                 "totalPnl" = :total_pnl,
-                "maxDrawdown" = COALESCE(:max_drawdown, "maxDrawdown"),
+                "peakAccountValue" = GREATEST(
+                    COALESCE("peakAccountValue", "initialCapital"),
+                    :current_value
+                ),
+                "maxDrawdown" = GREATEST(
+                    COALESCE("maxDrawdown", 0),
+                    CASE
+                        WHEN GREATEST(
+                            COALESCE("peakAccountValue", "initialCapital"),
+                            :current_value
+                        ) > 0
+                        THEN (
+                            (GREATEST(
+                                COALESCE("peakAccountValue", "initialCapital"),
+                                :current_value
+                            ) - :current_value)
+                            / GREATEST(
+                                COALESCE("peakAccountValue", "initialCapital"),
+                                :current_value
+                            ) * 100
+                        )
+                        ELSE 0
+                    END
+                ),
                 "updatedAt" = NOW()
             WHERE id = :mission_id
         """)
@@ -511,7 +542,6 @@ async def update_mission_pnl(
             "mission_id": mission_id,
             "current_value": current_value,
             "total_pnl": total_pnl,
-            "max_drawdown": max_drawdown,
         })
 
         return result.rowcount > 0

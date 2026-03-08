@@ -1249,6 +1249,196 @@ class HyperliquidClient:
                 "error": str(e),
             }
 
+    def build_trigger_order_action(
+        self,
+        asset: str,
+        is_long: bool,
+        size: float,
+        tp_price: float,
+        sl_price: float,
+    ) -> Dict[str, Any]:
+        """
+        Build the HL exchange action for native TP/SL trigger orders.
+
+        These execute at the exchange level (millisecond precision) — no polling needed.
+        The agent's risk monitor still runs as a backup to sync DB state.
+
+        Hyperliquid TP/SL orders:
+        - grouping: "normalTpsl" (individual tp/sl triggers)
+        - tpsl: "tp" or "sl"
+        - triggerPx: trigger price as string
+        - isMarket: true (market order on trigger)
+        - reduceOnly: true (only closes existing position)
+
+        Args:
+            asset: Asset symbol (e.g., "ETH-USD")
+            is_long: True if the parent position is LONG
+            size: Position size to close (same as entry size)
+            tp_price: Take profit trigger price
+            sl_price: Stop loss trigger price
+
+        Returns:
+            Action dict and nonce for signing and submission
+        """
+        coin = asset.replace("-USD", "")
+        asset_index = self._get_asset_index(coin)
+
+        # TP/SL are reduce-only orders in the opposite direction
+        close_is_buy = not is_long
+        nonce = int(time.time() * 1000)
+
+        tp_order = {
+            "a": asset_index,
+            "b": close_is_buy,
+            "p": str(tp_price),
+            "s": str(size),
+            "r": True,
+            "t": {
+                "trigger": {
+                    "isMarket": True,
+                    "triggerPx": str(tp_price),
+                    "tpsl": "tp",
+                }
+            },
+        }
+
+        sl_order = {
+            "a": asset_index,
+            "b": close_is_buy,
+            "p": str(sl_price),
+            "s": str(size),
+            "r": True,
+            "t": {
+                "trigger": {
+                    "isMarket": True,
+                    "triggerPx": str(sl_price),
+                    "tpsl": "sl",
+                }
+            },
+        }
+
+        action = {
+            "type": "order",
+            "orders": [tp_order, sl_order],
+            "grouping": "normalTpsl",
+        }
+
+        return {"action": action, "nonce": nonce}
+
+    async def place_trigger_orders(
+        self,
+        asset: str,
+        is_long: bool,
+        size: float,
+        tp_price: float,
+        sl_price: float,
+        mission_id: str,
+        wallet_bridge,
+    ) -> Dict[str, Any]:
+        """
+        Place native TP/SL trigger orders on Hyperliquid's matching engine.
+
+        Uses the same signing path as regular orders (sign_with_agent_key).
+        Non-fatal: if this fails, the polling risk monitor is the safety net.
+
+        Args:
+            asset: Asset symbol (e.g., "ETH-USD")
+            is_long: True if the parent position is LONG
+            size: Position size to close
+            tp_price: Take profit trigger price
+            sl_price: Stop loss trigger price
+            mission_id: Mission ID for agent key signing
+            wallet_bridge: TurnkeyBridge instance for signing
+
+        Returns:
+            Dict with success status
+        """
+        try:
+            trigger_data = self.build_trigger_order_action(
+                asset=asset,
+                is_long=is_long,
+                size=size,
+                tp_price=tp_price,
+                sl_price=sl_price,
+            )
+
+            action = trigger_data["action"]
+            nonce = trigger_data["nonce"]
+
+            # Build EIP-712 typed data for the trigger order
+            # Reuse the same domain and types as regular orders
+            domain = {
+                **HYPERLIQUID_EIP712_DOMAIN,
+                "chainId": 1 if self.is_mainnet else 1337,
+            }
+
+            typed_data = {
+                "domain": domain,
+                "types": ORDER_ACTION_TYPES,
+                "primaryType": "OrderAction",
+                "message": {
+                    "orders": action["orders"],
+                    "grouping": 0,  # normalTpsl maps to grouping=0 in EIP-712
+                    "nonce": nonce,
+                },
+            }
+
+            # Sign using the per-mission agent key
+            sign_result = await wallet_bridge.sign_with_agent_key(
+                mission_id=mission_id,
+                typed_data=typed_data,
+            )
+
+            if not sign_result.get("success"):
+                return {"success": False, "error": sign_result.get("error", "Signing failed")}
+
+            # Parse signature
+            sig = sign_result["signature"].replace("0x", "")
+            formatted_signature = {
+                "r": "0x" + sig[:64],
+                "s": "0x" + sig[64:128],
+                "v": int(sig[128:130], 16) if len(sig) >= 130 else 27,
+            }
+
+            result = await self._exchange_request(
+                action=action,
+                signature=formatted_signature,
+                nonce=nonce,
+            )
+
+            success = result.get("status") == "ok"
+            if success:
+                logger.info(
+                    "Native TP/SL bracket orders placed on HL",
+                    asset=asset,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    size=size,
+                    is_long=is_long,
+                )
+            else:
+                logger.warning(
+                    "TP/SL bracket submission returned non-ok",
+                    asset=asset,
+                    result=result,
+                )
+
+            return {
+                "success": success,
+                "response": result,
+                "tp_price": tp_price,
+                "sl_price": sl_price,
+            }
+
+        except Exception as e:
+            # Non-fatal: polling monitor is the safety net
+            logger.error(
+                "Failed to place native TP/SL brackets (polling backup active)",
+                asset=asset,
+                error=str(e),
+            )
+            return {"success": False, "error": str(e)}
+
     async def cancel_order(
         self,
         signed_payload: Dict[str, Any],
