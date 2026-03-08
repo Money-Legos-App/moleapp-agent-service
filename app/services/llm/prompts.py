@@ -38,11 +38,30 @@ MARKET REGIME AWARENESS:
 - OI exploding + price stalling = distribution/accumulation (localized top/bottom)
 - Funding > 0.05% hourly + price flat = crowded trade, high risk of liquidation flush
 
-CONFIDENCE CALIBRATION:
-- HIGH: 3+ confirming factors across timeframes (trend + orderbook + funding aligned), no contradicting signals, R/R >= 3x. Expected win rate >60%. Use sparingly — maybe 1-2 signals per cycle at most.
-- MEDIUM: 2 confirming factors, mild headwinds acceptable, R/R >= 2x, 50-60% expected win rate.
-- LOW: 1 confirming factor OR conflicting signals across timeframes OR weak edge. Use when the setup is marginal but worth flagging. LOW signals are traded with minimal size — they are NOT skipped.
-- IMPORTANT: Distribute confidence honestly. If you are generating signals, roughly 20% should be HIGH, 50% MEDIUM, 30% LOW across a full cycle. If everything looks MEDIUM, you are not differentiating — look harder at the data.
+CONFIDENCE CALIBRATION (use these quantitative checklists — count how many boxes are checked):
+
+HIGH — ALL 4 must be true:
+  1. Trend alignment: 1h AND 4h EMA20 vs EMA50 agree on direction (both bullish or both bearish)
+  2. Orderbook confirmation: bid_imbalance_pct >= +20% for LONG or <= -20% for SHORT
+  3. Funding tailwind OR neutral: funding does NOT oppose your direction (i.e., you are not paying >0.01%/hr)
+  4. R/R >= 3.0x based on nearest support/resistance levels
+  → If ANY of these 4 fails, you CANNOT use HIGH. Downgrade to MEDIUM.
+
+MEDIUM — at least 2 of these 4 are true:
+  1. One timeframe (1h or 4h) shows clear trend in your direction
+  2. RSI supports entry: <45 for LONG or >55 for SHORT (not overbought/oversold against you)
+  3. OI is rising (>+2% delta) = new money confirming the move
+  4. R/R >= 2.0x
+  → If fewer than 2 boxes are checked, downgrade to LOW.
+
+LOW — exactly 1 of the MEDIUM criteria is met, OR:
+  - Timeframes conflict (1h bullish, 4h bearish or vice versa)
+  - Volatility is below 0.5x average (choppy, no follow-through expected)
+  - Funding opposes your direction at >0.02%/hr (bleed risk)
+  - Orderbook is balanced (|bid_imbalance_pct| < 10%)
+  → LOW signals are still valid trades — they get minimal size (3-5% of capital). They are NOT skipped.
+
+IMPORTANT: Apply these checklists mechanically. If the data shows 1h EMA20 < EMA50 but 4h EMA20 > EMA50 for a LONG, that fails HIGH criterion #1 — period. Do not rationalize it as HIGH. In a typical cycle of 15 assets, expect roughly 1-3 HIGH, 5-8 MEDIUM, 4-7 LOW, and 2-5 no-trade. If all signals are the same confidence, you are not applying the checklist.
 
 CONFIDENCE GOLD STANDARDS (few-shot examples — calibrate your output against these):
 
