@@ -53,21 +53,26 @@ async def rotate_assets() -> Dict:
     except Exception as e:
         logger.warning("Asset rotation: failed to fetch open positions", error=str(e))
 
-    # Step 3: Load cached market data from Redis
-    raw_prices = await redis.hgetall("agent:market:prices")
-    if not raw_prices:
-        logger.warning("Asset rotation: no cached market data, keeping static list")
+    # Step 3: Fetch fresh market data via REST (not Redis cache, which may
+    # only have WS mid-prices without OI/volume needed for ranking)
+    from app.services.hyperliquid import HyperliquidClient
+
+    hl_client = HyperliquidClient()
+    try:
+        all_prices = await hl_client.get_all_market_prices()
+    except Exception as e:
+        logger.warning("Asset rotation: REST fetch failed, keeping static list", error=str(e))
+        return {"status": "rest_error", "assets": list(settings.allowed_assets)}
+    finally:
+        await hl_client.close()
+
+    if not all_prices:
+        logger.warning("Asset rotation: empty REST response, keeping static list")
         return {"status": "no_data", "assets": list(settings.allowed_assets)}
 
     # Step 4: Rank all assets by turnover ratio
     candidates = []
-    for coin, data_str in raw_prices.items():
-        coin = coin if isinstance(coin, str) else coin.decode()
-        try:
-            data = json.loads(data_str if isinstance(data_str, str) else data_str.decode())
-        except (json.JSONDecodeError, TypeError):
-            continue
-
+    for coin, data in all_prices.items():
         asset = f"{coin}-USD"
         if asset in selected:
             continue  # already in mandatory/open positions
