@@ -160,6 +160,7 @@ class ExecutionDispatcher:
                 "created_at": datetime.utcnow().isoformat(),
                 "attempts": 0,
             }
+            job["llm_provider"] = mission.get("llm_provider", "deepseek")
             pipe.rpush(QUEUE_KEY, json.dumps(job, default=str))
             jobs_created += 1
 
@@ -337,7 +338,7 @@ class ExecutionWorkerPool:
         """
         from app.services.hyperliquid import HyperliquidClient
         from app.services.wallet import TurnkeyBridge
-        from app.services.llm import DeepSeekClient
+        from app.services.llm import LLMRouter
         from app.services.circuit_breaker import get_circuit_breaker
         from app.services.observability.langfuse_client import get_langfuse
         from app.services.observability.prompt_manager import get_prompt_manager
@@ -346,6 +347,7 @@ class ExecutionWorkerPool:
         mission_id = job["mission_id"]
         cycle_id = job["cycle_id"]
         user_id = job.get("user_id")
+        llm_provider = job.get("llm_provider", "deepseek")
         circuit_breaker = get_circuit_breaker()
 
         # Langfuse: per-mission trace linked to the cycle session
@@ -359,11 +361,13 @@ class ExecutionWorkerPool:
                 "user-filter",
                 job.get("risk_level", "MODERATE"),
                 settings.environment,
+                f"llm:{llm_provider}",
             ],
             metadata={
                 "mission_id": mission_id,
                 "cycle_id": cycle_id,
                 "risk_level": job.get("risk_level"),
+                "llm_provider": llm_provider,
             },
         )
 
@@ -411,10 +415,11 @@ class ExecutionWorkerPool:
             if not user_address:
                 return {"success": False, "skipped": True, "reason": "no_wallet_address"}
 
-            # Initialize services
+            # Initialize services (LLM routed by mission's assigned provider)
             hl_client = HyperliquidClient()
             wallet_bridge = TurnkeyBridge()
-            llm = DeepSeekClient()
+            llm_router = LLMRouter()
+            llm = llm_router.get_client(llm_provider)
 
             try:
                 # Single API call: positions + account value combined
@@ -889,7 +894,7 @@ class ExecutionWorkerPool:
             finally:
                 await hl_client.close()
                 await wallet_bridge.close()
-                await llm.close()
+                await llm_router.close()
 
         except Exception as e:
             logger.error(

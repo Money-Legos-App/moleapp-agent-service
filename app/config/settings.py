@@ -81,6 +81,34 @@ class Settings(BaseSettings):
         alias="DEEPSEEK_MODEL",
     )
 
+    # Qwen LLM (competition against DeepSeek)
+    qwen_api_key: str = Field(default="", alias="QWEN_API_KEY")
+    qwen_api_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        alias="QWEN_API_URL",
+    )
+    qwen_model: str = Field(
+        default="qwen-plus",
+        alias="QWEN_MODEL",
+    )
+    qwen_cost_per_input_token: float = Field(
+        default=0.0000008,
+        alias="QWEN_COST_PER_INPUT_TOKEN",
+        description="Qwen cost per input token in USD",
+    )
+    qwen_cost_per_output_token: float = Field(
+        default=0.000002,
+        alias="QWEN_COST_PER_OUTPUT_TOKEN",
+        description="Qwen cost per output token in USD",
+    )
+
+    # LLM Competition Configuration
+    llm_competition_enabled: bool = Field(
+        default=True,
+        alias="LLM_COMPETITION_ENABLED",
+        description="Enable LLM competition (DeepSeek vs Qwen)",
+    )
+
     # Hyperliquid
     hyperliquid_api_url: str = Field(
         default="https://api.hyperliquid-testnet.xyz",

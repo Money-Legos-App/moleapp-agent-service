@@ -169,9 +169,20 @@ async def create_mission(
             detail=f"Invalid risk level. Must be one of: {valid_risk_levels}",
         )
 
-    # Validate allowed_assets against the platform's known asset list
+    # Assign LLM provider for competition (round-robin: alternating deepseek/qwen)
     from app.config import get_settings as _get_settings
     _settings = _get_settings()
+
+    llm_provider = "deepseek"  # default
+    if _settings.llm_competition_enabled and _settings.qwen_api_key:
+        from app.services.database import count_missions_by_provider
+        try:
+            ds_count, qwen_count = await count_missions_by_provider()
+            llm_provider = "qwen" if ds_count > qwen_count else "deepseek"
+        except Exception:
+            llm_provider = "deepseek"
+
+    # Validate allowed_assets against the platform's known asset list
     platform_assets = set(_settings.allowed_assets)
     invalid_assets = [a for a in request.allowed_assets if a not in platform_assets]
     if invalid_assets:
@@ -217,6 +228,13 @@ async def create_mission(
 
         mission = result.get("mission", {})
         mission_id_created = mission.get("id", "")
+
+        # Store LLM provider assignment
+        try:
+            from app.services.database import update_mission_llm_provider
+            await update_mission_llm_provider(mission_id_created, llm_provider)
+        except Exception as llm_err:
+            logger.warning("Failed to set llmProvider", mission_id=mission_id_created, error=str(llm_err))
 
         # Generate Master EOA locally + encrypt via Vault Transit
         master_eoa_address = None

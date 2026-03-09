@@ -86,6 +86,7 @@ class AgentMission(Base):
     turnkeySignerId = Column(String, nullable=True)
     hyperliquidApproved = Column(Boolean, default=False)
     approvalTxHash = Column(String, nullable=True)
+    llmProvider = Column(String, default="deepseek")
     strategy = Column(String, default="SHORT_TERM_30D")
     riskLevel = Column(String, default="MODERATE")
     durationDays = Column(Integer, default=30)
@@ -218,6 +219,7 @@ class AgentSignal(Base):
 
     id = Column(String, primary_key=True)
     signalId = Column(String, unique=True, nullable=False)
+    llmProvider = Column(String, default="deepseek")
     direction = Column(String, nullable=False)
     asset = Column(String, nullable=False)
     confidence = Column(String, nullable=False)
@@ -234,6 +236,7 @@ class AgentSignal(Base):
     usersNotified = Column(Integer, default=0)
     ordersGenerated = Column(Integer, default=0)
     ordersExecuted = Column(Integer, default=0)
+    responseTimeMs = Column(Integer, nullable=True)
 
 
 # ==================
@@ -270,6 +273,7 @@ async def get_active_missions() -> List[Dict[str, Any]]:
                 m."winRate" as win_rate,
                 m."maxDrawdown" as max_drawdown,
                 m."peakAccountValue" as peak_account_value,
+                m."llmProvider" as llm_provider,
                 t."turnkeySubOrgId" as turnkey_sub_org_id,
                 t."turnkeyUserId" as turnkey_user_id,
                 t.address as user_wallet_address
@@ -306,6 +310,7 @@ async def get_active_missions() -> List[Dict[str, Any]]:
                 "win_rate": row.win_rate or 0,
                 "max_drawdown": row.max_drawdown or 0,
                 "peak_account_value": float(row.peak_account_value) if row.peak_account_value else None,
+                "llm_provider": row.llm_provider or "deepseek",
                 "turnkey_sub_org_id": row.turnkey_sub_org_id,
                 "turnkey_user_id": row.turnkey_user_id,
                 "user_wallet_address": row.user_wallet_address,
@@ -769,15 +774,15 @@ async def save_signal(signal: Dict[str, Any], cycle_id: str) -> str:
 
         query = text("""
             INSERT INTO agent_signals (
-                id, "signalId", direction, asset, confidence,
+                id, "signalId", "llmProvider", direction, asset, confidence,
                 "recommendedLeverage", reasoning, "strategyTag",
                 "ragContextIds", "maxDrawdown30d", "volatilityScore",
-                "generatedAt", "expiresAt", "isProcessed"
+                "generatedAt", "expiresAt", "isProcessed", "responseTimeMs"
             ) VALUES (
-                :id, :signal_id, :direction, :asset, :confidence,
+                :id, :signal_id, :llm_provider, :direction, :asset, :confidence,
                 :leverage, :reasoning, :strategy_tag,
                 :rag_ids, :max_dd, :vol_score,
-                :generated_at, :expires_at, false
+                :generated_at, :expires_at, false, :response_time_ms
             )
             ON CONFLICT ("signalId") DO UPDATE SET
                 direction = EXCLUDED.direction,
@@ -794,6 +799,7 @@ async def save_signal(signal: Dict[str, Any], cycle_id: str) -> str:
         await db.execute(query, {
             "id": signal_db_id,
             "signal_id": signal_id,
+            "llm_provider": signal.get("_llm_provider", "deepseek"),
             "direction": signal.get("direction", "LONG"),
             "asset": signal.get("asset", ""),
             "confidence": signal.get("confidence", "LOW"),
@@ -805,6 +811,7 @@ async def save_signal(signal: Dict[str, Any], cycle_id: str) -> str:
             "vol_score": signal.get("volatility_score"),
             "generated_at": generated_at,
             "expires_at": expires_at,
+            "response_time_ms": signal.get("_response_time_ms"),
         })
 
         logger.info(
@@ -815,6 +822,34 @@ async def save_signal(signal: Dict[str, Any], cycle_id: str) -> str:
         )
 
         return signal_id
+
+
+async def update_mission_llm_provider(mission_id: str, llm_provider: str) -> None:
+    """Set the llmProvider for a mission (competition assignment)."""
+    async with get_db() as db:
+        await db.execute(
+            text('UPDATE agent_missions SET "llmProvider" = :provider WHERE id = :id'),
+            {"provider": llm_provider, "id": mission_id},
+        )
+
+
+async def count_missions_by_provider() -> tuple:
+    """
+    Count missions per LLM provider for round-robin balancing.
+
+    Returns:
+        (deepseek_count, qwen_count) tuple
+    """
+    async with get_db() as db:
+        result = await db.execute(text("""
+            SELECT
+                COALESCE(SUM(CASE WHEN "llmProvider" = 'deepseek' THEN 1 ELSE 0 END), 0) as ds_count,
+                COALESCE(SUM(CASE WHEN "llmProvider" = 'qwen' THEN 1 ELSE 0 END), 0) as qwen_count
+            FROM agent_missions
+            WHERE status IN ('PENDING', 'ACTIVE', 'DEPOSITING', 'PAUSED')
+        """))
+        row = result.fetchone()
+        return (int(row.ds_count), int(row.qwen_count))
 
 
 async def get_signals(

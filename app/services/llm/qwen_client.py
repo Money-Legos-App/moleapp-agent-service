@@ -1,8 +1,12 @@
 """
-DeepSeek LLM Client for Trading Analysis
+Qwen LLM Client for Trading Analysis (LLM Competition)
+
+Mirrors DeepSeekClient exactly — same interface, same prompts, same JSON format.
+Only the API endpoint and model name differ. This ensures a fair competition.
 """
 
 import json
+import time as _time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -14,14 +18,15 @@ from .prompts import PromptTemplates
 logger = structlog.get_logger(__name__)
 
 
-class DeepSeekClient:
+class QwenClient:
     """
-    Client for DeepSeek LLM API.
+    Client for Qwen (Alibaba Cloud) LLM API.
 
-    Used for:
-    - Market analysis and signal generation
-    - User-specific trade filtering
-    - Position exit decisions
+    Uses the OpenAI-compatible endpoint (DashScope).
+    Same 3 methods as DeepSeekClient for drop-in competition:
+    - analyze_market()
+    - filter_for_user()
+    - analyze_position_exit()
     """
 
     def __init__(
@@ -30,25 +35,22 @@ class DeepSeekClient:
         api_url: Optional[str] = None,
         model: Optional[str] = None,
     ):
-        """Initialize the DeepSeek client."""
         from app.config import get_settings
 
         settings = get_settings()
-        self.api_key = api_key or settings.deepseek_api_key
-        self.api_url = api_url or settings.deepseek_api_url
-        self.model = model or settings.deepseek_model
+        self.api_key = api_key or settings.qwen_api_key
+        self.api_url = api_url or settings.qwen_api_url
+        self.model = model or settings.qwen_model
 
         if not self.api_key:
-            logger.warning("DeepSeek API key not configured")
+            logger.warning("Qwen API key not configured")
 
         self._client: Optional[httpx.AsyncClient] = None
-        # Audit: stores last API call metadata for callers to read
         self._last_usage: Dict[str, Any] = {}
         self._last_raw_response: Optional[str] = None
         self._last_response_time_ms: Optional[int] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the HTTP client."""
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=60.0,
@@ -60,7 +62,6 @@ class DeepSeekClient:
         return self._client
 
     async def close(self) -> None:
-        """Close the HTTP client."""
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -74,27 +75,11 @@ class DeepSeekClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
         max_tokens: int = 1000,
-        # Langfuse instrumentation (all optional — defaults to no-op)
         trace=None,
         lf_prompt=None,
         generation_name: str = "llm_call",
         generation_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """
-        Make a request to the DeepSeek API.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'
-            temperature: Sampling temperature (lower = more deterministic)
-            max_tokens: Maximum response tokens
-            trace: Langfuse trace object for observability
-            lf_prompt: Langfuse prompt object to link generation to prompt version
-            generation_name: Name for the Langfuse generation span
-            generation_metadata: Extra metadata for the generation
-
-        Returns:
-            Response content string
-        """
         client = await self._get_client()
 
         payload = {
@@ -105,20 +90,19 @@ class DeepSeekClient:
             "response_format": {"type": "json_object"},
         }
 
-        # Add top_p for nucleus sampling when temperature > 0.4
-        # Constrains creative sampling to the top 90% of tokens
         if temperature > 0.4:
             payload["top_p"] = 0.9
 
         logger.info(
             "AUDIT LLM request",
             model=self.model,
+            provider="qwen",
             message_count=len(messages),
             prompt_chars=sum(len(m.get("content", "")) for m in messages),
             temperature=temperature,
         )
 
-        # Start Langfuse generation BEFORE the API call
+        # Langfuse generation span
         generation = None
         if trace is not None:
             try:
@@ -132,13 +116,13 @@ class DeepSeekClient:
                 )
                 gen_update["metadata"]["temperature"] = temperature
                 gen_update["metadata"]["max_tokens"] = max_tokens
+                gen_update["metadata"]["provider"] = "qwen"
                 if lf_prompt is not None:
                     gen_update["metadata"]["prompt_name"] = getattr(lf_prompt, "name", str(lf_prompt))
                 generation.update(**gen_update)
             except Exception:
                 generation = None
 
-        import time as _time
         _api_start = _time.monotonic()
 
         response = await client.post(
@@ -152,24 +136,24 @@ class DeepSeekClient:
         data = response.json()
         content = data["choices"][0]["message"]["content"]
 
-        # Store usage metadata for audit logging
         self._last_usage = data.get("usage", {})
         self._last_raw_response = content
 
         logger.info(
             "AUDIT LLM response",
             model=self.model,
+            provider="qwen",
             tokens_prompt=self._last_usage.get("prompt_tokens"),
             tokens_completion=self._last_usage.get("completion_tokens"),
             tokens_total=self._last_usage.get("total_tokens"),
             response_chars=len(content),
+            response_time_ms=self._last_response_time_ms,
         )
 
-        # Finalize Langfuse generation with usage and cost
+        # Finalize Langfuse generation
         if generation is not None:
             try:
                 from app.config import get_settings
-
                 settings = get_settings()
                 prompt_tokens = self._last_usage.get("prompt_tokens", 0)
                 completion_tokens = self._last_usage.get("completion_tokens", 0)
@@ -182,12 +166,14 @@ class DeepSeekClient:
                         "total": self._last_usage.get("total_tokens", 0),
                     },
                     metadata={
-                        "input_cost": prompt_tokens * settings.deepseek_cost_per_input_token,
-                        "output_cost": completion_tokens * settings.deepseek_cost_per_output_token,
+                        "input_cost": prompt_tokens * settings.qwen_cost_per_input_token,
+                        "output_cost": completion_tokens * settings.qwen_cost_per_output_token,
                         "total_cost": (
-                            prompt_tokens * settings.deepseek_cost_per_input_token
-                            + completion_tokens * settings.deepseek_cost_per_output_token
+                            prompt_tokens * settings.qwen_cost_per_input_token
+                            + completion_tokens * settings.qwen_cost_per_output_token
                         ),
+                        "provider": "qwen",
+                        "response_time_ms": self._last_response_time_ms,
                     },
                 )
                 generation.end()
@@ -197,12 +183,9 @@ class DeepSeekClient:
         return content
 
     def _parse_json_response(self, content: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response."""
         try:
-            # Try direct parsing
             return json.loads(content)
         except json.JSONDecodeError:
-            # Try to extract JSON from markdown code block
             if "```json" in content:
                 json_str = content.split("```json")[1].split("```")[0].strip()
                 return json.loads(json_str)
@@ -225,30 +208,10 @@ class DeepSeekClient:
         tf_summary: Optional[str] = None,
         oi_delta: Optional[Dict[str, Any]] = None,
         bid_imbalance_pct: float = 0.0,
-        # Langfuse instrumentation
         trace=None,
         lf_prompt=None,
     ) -> Dict[str, Any]:
-        """
-        Analyze market conditions and generate a trading signal.
-
-        Args:
-            asset: Asset symbol (e.g., "ETH-USD")
-            current_price: Current market price
-            price_change_24h: 24-hour price change percentage
-            volume_24h: 24-hour trading volume
-            spread: Bid-ask spread percentage
-            pattern_context: Context from similar historical patterns (None if RAG disabled)
-            risk_metrics: Risk metrics from FAISS patterns (None if RAG disabled)
-            funding_rate: Current funding rate (hourly, raw)
-            open_interest: Current open interest in USD
-            tf_summary: Multi-timeframe technical analysis string
-            oi_delta: OI change and volume delta vs previous cycle
-            bid_imbalance_pct: Orderbook bid/ask imbalance percentage
-
-        Returns:
-            Trading signal dictionary
-        """
+        """Analyze market conditions — identical interface to DeepSeekClient."""
         user_prompt = PromptTemplates.format_market_analysis(
             asset=asset,
             current_price=current_price,
@@ -276,15 +239,13 @@ class DeepSeekClient:
                 trace=trace,
                 lf_prompt=lf_prompt,
                 generation_name="market_analysis",
-                generation_metadata={"asset": asset},
+                generation_metadata={"asset": asset, "provider": "qwen"},
             )
             signal = self._parse_json_response(response)
 
-            # Add metadata
             signal["asset"] = asset
-            signal["generated_at"] = None  # Will be set by caller
+            signal["generated_at"] = None
 
-            # Attach audit data for workflow nodes to persist
             signal["_audit_prompt"] = user_prompt
             signal["_audit_response"] = response
             signal["_audit_model"] = self.model
@@ -294,6 +255,7 @@ class DeepSeekClient:
             logger.info(
                 "Market analysis completed",
                 asset=asset,
+                provider="qwen",
                 should_trade=signal.get("should_trade"),
                 direction=signal.get("direction"),
                 confidence=signal.get("confidence"),
@@ -302,12 +264,7 @@ class DeepSeekClient:
             return signal
 
         except Exception as e:
-            logger.error(
-                "Market analysis failed",
-                asset=asset,
-                error=str(e),
-            )
-            # Return safe default with audit data
+            logger.error("Market analysis failed", asset=asset, provider="qwen", error=str(e))
             return {
                 "should_trade": False,
                 "direction": None,
@@ -329,23 +286,10 @@ class DeepSeekClient:
         existing_positions: List[Dict[str, Any]],
         margin_used: float = 0.0,
         account_value: float = 0.0,
-        # Langfuse instrumentation
         trace=None,
         lf_prompt=None,
     ) -> Dict[str, Any]:
-        """
-        Determine if a signal should be executed for a specific user.
-
-        Args:
-            signal: Trading signal from market analysis
-            mission: User's mission parameters
-            existing_positions: User's current open positions
-            margin_used: Total margin currently deployed (from clearinghouse)
-            account_value: Total account value (from clearinghouse)
-
-        Returns:
-            Execution decision dictionary
-        """
+        """User-specific trade filter — identical interface to DeepSeekClient."""
         user_prompt = PromptTemplates.format_user_filter(
             signal=signal,
             mission=mission,
@@ -366,30 +310,27 @@ class DeepSeekClient:
                 trace=trace,
                 lf_prompt=lf_prompt,
                 generation_name="user_filter",
-                generation_metadata={"mission_id": mission.get("id"), "asset": signal.get("asset")},
+                generation_metadata={"mission_id": mission.get("id"), "asset": signal.get("asset"), "provider": "qwen"},
             )
             decision = self._parse_json_response(response)
 
-            # Attach audit data
             decision["_audit_prompt"] = user_prompt
             decision["_audit_response"] = response
             decision["_audit_model"] = self.model
             decision["_audit_tokens"] = self._last_usage.get("total_tokens")
+            decision["_response_time_ms"] = self._last_response_time_ms
 
             logger.info(
                 "User filter completed",
                 mission_id=mission.get("id"),
+                provider="qwen",
                 should_execute=decision.get("should_execute"),
             )
 
             return decision
 
         except Exception as e:
-            logger.error(
-                "User filter failed",
-                mission_id=mission.get("id"),
-                error=str(e),
-            )
+            logger.error("User filter failed", mission_id=mission.get("id"), provider="qwen", error=str(e))
             return {
                 "should_execute": False,
                 "skip_reason": f"Filter failed: {str(e)}",
@@ -397,6 +338,7 @@ class DeepSeekClient:
                 "_audit_response": None,
                 "_audit_model": self.model,
                 "_audit_tokens": None,
+                "_response_time_ms": None,
                 "_audit_error": str(e),
             }
 
@@ -405,21 +347,10 @@ class DeepSeekClient:
         position: Dict[str, Any],
         mission: Dict[str, Any],
         market_data: Dict[str, Any],
-        # Langfuse instrumentation
         trace=None,
         lf_prompt=None,
     ) -> Dict[str, Any]:
-        """
-        Analyze whether a position should be exited.
-
-        Args:
-            position: Current position details
-            mission: Mission parameters
-            market_data: Current market conditions
-
-        Returns:
-            Exit decision dictionary
-        """
+        """Position exit analysis — identical interface to DeepSeekClient."""
         user_prompt = PromptTemplates.format_position_exit(
             position=position,
             mission=mission,
@@ -438,32 +369,27 @@ class DeepSeekClient:
                 trace=trace,
                 lf_prompt=lf_prompt,
                 generation_name="position_exit",
-                generation_metadata={"asset": position.get("asset"), "direction": position.get("direction")},
+                generation_metadata={"asset": position.get("asset"), "provider": "qwen"},
             )
             decision = self._parse_json_response(response)
 
-            # Attach audit data
             decision["_audit_prompt"] = user_prompt
             decision["_audit_response"] = response
             decision["_audit_model"] = self.model
             decision["_audit_tokens"] = self._last_usage.get("total_tokens")
+            decision["_response_time_ms"] = self._last_response_time_ms
 
             logger.info(
                 "Position exit analysis completed",
                 position_id=position.get("id"),
+                provider="qwen",
                 should_exit=decision.get("should_exit"),
-                reason=decision.get("exit_reason"),
             )
 
             return decision
 
         except Exception as e:
-            logger.error(
-                "Position exit analysis failed",
-                position_id=position.get("id"),
-                error=str(e),
-            )
-            # Default to holding position on error
+            logger.error("Position exit analysis failed", position_id=position.get("id"), provider="qwen", error=str(e))
             return {
                 "should_exit": False,
                 "urgency": "hold",
@@ -472,55 +398,6 @@ class DeepSeekClient:
                 "_audit_response": None,
                 "_audit_model": self.model,
                 "_audit_tokens": None,
+                "_response_time_ms": None,
                 "_audit_error": str(e),
             }
-
-    async def batch_analyze_markets(
-        self,
-        assets: List[str],
-        market_data: Dict[str, Dict[str, Any]],
-        pattern_contexts: Dict[str, str],
-        risk_metrics: Dict[str, Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """
-        Analyze multiple assets in batch.
-
-        Args:
-            assets: List of asset symbols
-            market_data: Market data keyed by asset
-            pattern_contexts: Pattern contexts keyed by asset
-            risk_metrics: Risk metrics keyed by asset
-
-        Returns:
-            List of trading signals
-        """
-        import asyncio
-
-        tasks = []
-        for asset in assets:
-            data = market_data.get(asset, {})
-            tasks.append(
-                self.analyze_market(
-                    asset=asset,
-                    current_price=data.get("price", 0),
-                    price_change_24h=data.get("price_change_24h", 0),
-                    volume_24h=data.get("volume_24h", 0),
-                    spread=data.get("spread", 0.01),
-                    pattern_context=pattern_contexts.get(asset, "No historical context"),
-                    risk_metrics=risk_metrics.get(asset, {}),
-                    funding_rate=data.get("funding_rate", 0),
-                    open_interest=data.get("open_interest", 0),
-                )
-            )
-
-        signals = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Filter out exceptions
-        valid_signals = []
-        for signal in signals:
-            if isinstance(signal, Exception):
-                logger.error("Batch analysis error", error=str(signal))
-                continue
-            valid_signals.append(signal)
-
-        return valid_signals
