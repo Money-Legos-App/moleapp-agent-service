@@ -624,66 +624,8 @@ class TurnkeyBridge:
         return result
 
     # ==================
-    # Hyperliquid Bridge
+    # Hyperliquid Operations
     # ==================
-
-    async def deposit_to_hyperliquid(
-        self,
-        mission_id: str,
-        amount: str,
-        chain_id: int = None,
-    ) -> Dict[str, Any]:
-        """
-        Initiate a USDC deposit to Hyperliquid via the bridge on Arbitrum.
-
-        This triggers a gasless UserOperation that:
-        1. Approves USDC spending by the bridge contract
-        2. Deposits USDC to the Hyperliquid bridge
-
-        The mission status transitions: PENDING → DEPOSITING.
-
-        Args:
-            mission_id: Mission ID
-            amount: USDC amount as string (e.g., "10.0")
-            chain_id: Target chain ID (defaults to mainnet/testnet based on config)
-
-        Returns:
-            Deposit result with userOpHash for tracking
-        """
-        if chain_id is None:
-            from app.config import get_settings
-            settings = get_settings()
-            chain_id = 42161 if settings.hyperliquid_mainnet else 421614
-        try:
-            result = await self._request(
-                "POST",
-                "/internal/v1/agent/deposit-to-hyperliquid",
-                json={
-                    "missionId": mission_id,
-                    "amount": amount,
-                    "chainId": chain_id,
-                },
-            )
-
-            logger.info(
-                "HL bridge deposit initiated via wallet-service",
-                mission_id=mission_id,
-                user_op_hash=result.get("userOpHash"),
-                success=result.get("success", False),
-            )
-
-            return result
-
-        except Exception as e:
-            logger.error(
-                "HL bridge deposit failed",
-                mission_id=mission_id,
-                error=str(e),
-            )
-            return {
-                "success": False,
-                "error": str(e),
-            }
 
     async def withdraw_from_hyperliquid(
         self,
@@ -739,58 +681,6 @@ class TurnkeyBridge:
     # Vault Master EOA Support
     # ==================
 
-    async def transfer_usdc_to_master_eoa(
-        self,
-        mission_id: str,
-        master_eoa_address: str,
-        amount: str,
-    ) -> Dict[str, Any]:
-        """
-        Transfer USDC from user's ZeroDev wallet to the mission's Master EOA on Arbitrum.
-
-        Executed as a gasless UserOperation via Pimlico paymaster.
-
-        Args:
-            mission_id: Mission ID
-            master_eoa_address: Vault-derived Master EOA address on Arbitrum
-            amount: USDC amount as string (e.g., "500.0")
-
-        Returns:
-            Result with userOpHash for tracking
-        """
-        try:
-            result = await self._request(
-                "POST",
-                "/internal/v1/agent/transfer-to-master-eoa",
-                json={
-                    "missionId": mission_id,
-                    "masterEoaAddress": master_eoa_address,
-                    "amount": amount,
-                },
-            )
-
-            logger.info(
-                "USDC transfer to Master EOA initiated",
-                mission_id=mission_id,
-                master_eoa=master_eoa_address,
-                user_op_hash=result.get("userOpHash"),
-                success=result.get("success", False),
-            )
-
-            return result
-
-        except Exception as e:
-            logger.error(
-                "Transfer to Master EOA failed",
-                mission_id=mission_id,
-                master_eoa=master_eoa_address,
-                error=str(e),
-            )
-            return {
-                "success": False,
-                "error": str(e),
-            }
-
     async def store_agent_address(
         self,
         mission_id: str,
@@ -838,7 +728,7 @@ class TurnkeyBridge:
             }
 
     # ==================
-    # Across Bridge (Cross-Chain to Arbitrum)
+    # Across Bridge (Cross-Chain to Hyperliquid via HyperEVM)
     # ==================
 
     async def get_best_source_chain(
@@ -861,13 +751,43 @@ class TurnkeyBridge:
                     "token": token,
                 },
             )
-            return result.get("data", {"chainId": 42161, "balance": "0", "needsBridge": False})
+            return result.get("data", {"chainId": 1, "balance": "0", "needsBridge": True})
         except Exception as e:
             logger.error("Failed to get best source chain", wallet_id=wallet_id, error=str(e))
-            # Default to Arbitrum (no bridge)
-            return {"chainId": 42161, "balance": "0", "needsBridge": False}
+            return {"chainId": 1, "balance": "0", "needsBridge": True}
 
-    async def across_bridge_to_arbitrum(
+    async def get_source_chains(
+        self,
+        wallet_id: str,
+        amount: str,
+        token: str = "USDC",
+    ) -> Dict[str, Any]:
+        """
+        Find optimal source chain(s) for bridging — supports multi-chain sweep.
+        Returns { chains: [{chainId, balance, amount}], needsBridge, needsSweep }.
+        """
+        try:
+            result = await self._request(
+                "GET",
+                "/internal/v1/agent/find-source-chains",
+                params={
+                    "walletId": wallet_id,
+                    "amount": amount,
+                    "token": token,
+                },
+            )
+            return result.get("data", {"chains": [], "needsBridge": True, "needsSweep": False})
+        except Exception as e:
+            logger.error("Failed to get source chains", wallet_id=wallet_id, error=str(e))
+            # Fall back to single-chain behavior
+            best = await self.get_best_source_chain(wallet_id, amount, token)
+            return {
+                "chains": [{"chainId": best["chainId"], "balance": best["balance"], "amount": amount}],
+                "needsBridge": best["needsBridge"],
+                "needsSweep": False,
+            }
+
+    async def across_bridge_to_hyperliquid(
         self,
         mission_id: str,
         wallet_id: str,
@@ -877,13 +797,14 @@ class TurnkeyBridge:
         recipient_address: str = "",
     ) -> Dict[str, Any]:
         """
-        Bridge funds to Arbitrum via Across Protocol for mission activation.
-        Called when source chain != Arbitrum.
+        Bridge funds directly to Hyperliquid via Across Protocol (HyperEVM chain 999).
+        Across fills on HyperEVM → auto-routed to HyperCore as USDH.
+        Recipient is the Master EOA address — funds land directly in trading account.
         """
         try:
             result = await self._request(
                 "POST",
-                "/internal/v1/agent/across-bridge-to-arbitrum",
+                "/internal/v1/agent/across-bridge-to-hyperliquid",
                 json={
                     "missionId": mission_id,
                     "walletId": wallet_id,
@@ -895,7 +816,7 @@ class TurnkeyBridge:
             )
 
             logger.info(
-                "Across bridge initiated",
+                "Across bridge to Hyperliquid initiated",
                 mission_id=mission_id,
                 source_chain=source_chain_id,
                 bridge_op_id=result.get("data", {}).get("bridgeOperationId"),
@@ -905,7 +826,7 @@ class TurnkeyBridge:
 
         except Exception as e:
             logger.error(
-                "Across bridge to Arbitrum failed",
+                "Across bridge to Hyperliquid failed",
                 mission_id=mission_id,
                 source_chain=source_chain_id,
                 error=str(e),

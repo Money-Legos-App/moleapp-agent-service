@@ -503,76 +503,98 @@ async def activate_mission(
 
         else:
             # =============================================
-            # MAINNET PATH:
-            # 0. Auto-detect source chain (Across bridge if not on Arbitrum)
-            # 1. Transfer USDC from user's ZeroDev → Master EOA on Arbitrum
-            # 2. Bridge Master EOA USDC → Hyperliquid L1 (Vault-signed)
-            # 3. Deposit polling detects funds → Vault approves agent → ACTIVE
+            # MAINNET PATH (Direct to Hyperliquid via Across):
+            # 1. Auto-detect source chain(s) — supports multi-chain sweep
+            # 2. Across bridge → HyperEVM (999) → HyperCore (USDH)
+            #    Recipient = Master EOA → funds land directly in trading account
+            # 3. Deposit polling detects cumulative USDH → Vault approves agent → ACTIVE
             # =============================================
+            import asyncio
             bridge = TurnkeyBridge()
 
-            # Auto-detect which chain has funds (Arbitrum preferred = no bridge)
             wallet_id = mission.get("wallet_id", "")
             amount_str = str(mission["initial_capital"])
-            source = await bridge.get_best_source_chain(
+            input_token = mission.get("deposit_currency", "USDC")
+
+            # Auto-detect optimal source chain(s) with knapsack routing
+            sources = await bridge.get_source_chains(
                 wallet_id=wallet_id,
                 amount=amount_str,
             )
-            source_chain = source.get("chainId", 42161)
-            needs_bridge = source.get("needsBridge", False)
+            needs_bridge = sources.get("needsBridge", True)
+            needs_sweep = sources.get("needsSweep", False)
+            chains = sources.get("chains", [])
 
-            if needs_bridge and source_chain != 42161:
-                # Cross-chain: bridge to Arbitrum via Across first
-                logger.info(
-                    "Cross-chain bridge needed for mission",
-                    mission_id=mission_id,
-                    source_chain=source_chain,
-                )
-                bridge_result = await bridge.across_bridge_to_arbitrum(
-                    mission_id=mission_id,
-                    wallet_id=wallet_id,
-                    amount=amount_str,
-                    source_chain_id=source_chain,
-                    input_token=mission.get("deposit_currency", "USDC"),
-                    recipient_address=master_eoa or "",
-                )
-                if not bridge_result.get("success", True):
-                    await bridge.close()
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=f"Cross-chain bridge failed: {bridge_result.get('error', 'Unknown')}",
+            if needs_bridge and chains:
+                if needs_sweep:
+                    # Multi-chain sweep: set FUNDING state, fire bridges concurrently
+                    await update_mission_status(mission_id, "FUNDING")
+                    logger.info(
+                        "Cross-chain sweep to Hyperliquid",
+                        mission_id=mission_id,
+                        chains=[c["chainId"] for c in chains],
+                        amounts=[c["amount"] for c in chains],
+                        recipient=master_eoa,
                     )
-                # Bridge poller will track PENDING → FILLED on wallet-service side
-                # Continue to DEPOSITING status — deposit_polling will pick up from here
 
-            if master_eoa:
-                # Transfer USDC to Master EOA on Arbitrum, then bridge via Vault
-                deposit_result = await bridge.transfer_usdc_to_master_eoa(
-                    mission_id=mission_id,
-                    master_eoa_address=master_eoa,
-                    amount=amount_str,
-                )
-            else:
-                # Fallback: legacy flow (direct bridge from smart wallet)
-                deposit_result = await bridge.deposit_to_hyperliquid(
-                    mission_id=mission_id,
-                    amount=amount_str,
-                )
+                    # Fire all bridges concurrently — Kernel wallets have independent nonces per chain
+                    bridge_tasks = [
+                        bridge.across_bridge_to_hyperliquid(
+                            mission_id=mission_id,
+                            wallet_id=wallet_id,
+                            amount=chain_info["amount"],
+                            source_chain_id=chain_info["chainId"],
+                            input_token=input_token,
+                            recipient_address=master_eoa or "",
+                        )
+                        for chain_info in chains
+                    ]
+                    results = await asyncio.gather(*bridge_tasks, return_exceptions=True)
+
+                    # Log any individual failures (deposit worker will catch partial funding via timeout)
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(
+                                f"Sweep bridge {i} failed",
+                                chain_id=chains[i]["chainId"],
+                                error=str(result),
+                                mission_id=mission_id,
+                            )
+                else:
+                    # Single-chain bridge (cheapest valid chain)
+                    source_chain = chains[0]["chainId"]
+                    logger.info(
+                        "Across bridge to Hyperliquid for mission",
+                        mission_id=mission_id,
+                        source_chain=source_chain,
+                        recipient=master_eoa,
+                    )
+                    bridge_result = await bridge.across_bridge_to_hyperliquid(
+                        mission_id=mission_id,
+                        wallet_id=wallet_id,
+                        amount=amount_str,
+                        source_chain_id=source_chain,
+                        input_token=input_token,
+                        recipient_address=master_eoa or "",
+                    )
+
+                    if not bridge_result.get("success", True):
+                        await bridge.close()
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Bridge to Hyperliquid failed: {bridge_result.get('error', 'Unknown')}",
+                        )
+
             await bridge.close()
 
-            if not deposit_result.get("success"):
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=deposit_result.get("error", "Deposit initiation failed"),
-                )
-
-            # Update status to DEPOSITING
-            await update_mission_status(mission_id, "DEPOSITING")
+            # Update status to DEPOSITING (or keep FUNDING if sweep)
+            if not needs_sweep:
+                await update_mission_status(mission_id, "DEPOSITING")
 
             # Enqueue event-driven deposit check via arq
+            # For sweep: worker checks cumulative balance >= expected_amount
             try:
                 from app.workers.deposit_worker import enqueue_deposit_check
-                # Check balance on Master EOA (or fallback to user address)
                 check_address = master_eoa or mission.get("kernel_account_address") or mission.get("user_wallet_address", "")
                 await enqueue_deposit_check(
                     mission_id=mission_id,
@@ -594,10 +616,11 @@ async def activate_mission(
                 )
 
             return {
-                "status": "depositing",
+                "status": "funding" if needs_sweep else "depositing",
                 "mission_id": mission_id,
                 "message": "Deposit initiated. Mission will activate once funds arrive on Hyperliquid.",
-                "deposit_tx": deposit_result.get("userOpHash"),
+                "sweep": needs_sweep,
+                "bridge_count": len(chains),
             }
 
     except HTTPException:
@@ -703,7 +726,7 @@ async def revoke_mission(
             detail="Mission not found",
         )
 
-    revocable_statuses = {"PENDING", "ACTIVE", "PAUSED", "DEPOSITING", "APPROVING"}
+    revocable_statuses = {"PENDING", "FUNDING", "ACTIVE", "PAUSED", "DEPOSITING", "APPROVING"}
     if mission["status"] not in revocable_statuses:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
