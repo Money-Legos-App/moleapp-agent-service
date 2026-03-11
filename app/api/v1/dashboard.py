@@ -75,6 +75,16 @@ class RecentTradeInfo(BaseModel):
     executed_at: datetime
 
 
+class LiveBalanceInfo(BaseModel):
+    """Live on-chain balance from Hyperliquid clearinghouse."""
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    account_value: Optional[float] = None
+    withdrawable: Optional[float] = None
+    margin_used: Optional[float] = None
+    is_live: bool = False
+
+
 class MissionDashboard(BaseModel):
     """Complete mission dashboard data."""
     model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
@@ -88,6 +98,7 @@ class MissionDashboard(BaseModel):
     performance: PerformanceInfo
     positions: List[PositionInfo]
     recent_trades: List[RecentTradeInfo]
+    live_balance: Optional[LiveBalanceInfo] = None
 
 
 class PnLDataPoint(BaseModel):
@@ -135,6 +146,31 @@ class TradesResponse(BaseModel):
 
 
 # ==================
+# Helpers
+# ==================
+
+async def _fetch_live_hl_balance(master_eoa_address: str) -> Optional[dict]:
+    """Fetch live balance from HL. Returns None on any failure (never raises)."""
+    if not master_eoa_address:
+        return None
+    try:
+        import asyncio
+        from app.services.hyperliquid import HyperliquidClient
+        hl_client = HyperliquidClient()
+        try:
+            state = await asyncio.wait_for(
+                hl_client.get_clearinghouse_state(master_eoa_address),
+                timeout=5.0,
+            )
+            return state.get("account")
+        finally:
+            await hl_client.close()
+    except Exception as e:
+        logger.warning("Live HL balance fetch failed (using DB fallback)", error=str(e))
+        return None
+
+
+# ==================
 # Endpoints
 # ==================
 
@@ -153,6 +189,7 @@ async def get_mission_dashboard(
     - Performance metrics
     - Current positions with live prices
     - Recent trades
+    - Live on-chain balance from Hyperliquid
     """
     from app.services.database import (
         get_mission_by_id,
@@ -169,12 +206,31 @@ async def get_mission_dashboard(
             detail="Mission not found",
         )
 
-    # Fetch open positions and recent trades
-    positions = await get_open_positions(mission_id)
-    trades_raw, _ = await get_trade_executions(mission_id, user.user_id, limit=5, offset=0)
+    # Fetch open positions, recent trades, and live HL balance concurrently
+    import asyncio
+    positions_task = get_open_positions(mission_id)
+    trades_task = get_trade_executions(mission_id, user.user_id, limit=5, offset=0)
+    hl_task = _fetch_live_hl_balance(mission.get("master_eoa_address", ""))
+
+    positions, (trades_raw, _), live_account = await asyncio.gather(
+        positions_task, trades_task, hl_task
+    )
 
     initial_capital = mission["initial_capital"]
-    current_value = mission["current_value"] if mission["current_value"] else initial_capital
+
+    # Prefer live HL account value when available
+    live_balance = None
+    if live_account:
+        live_balance = LiveBalanceInfo(
+            account_value=live_account["account_value"],
+            withdrawable=live_account["withdrawable"],
+            margin_used=live_account["total_margin_used"],
+            is_live=True,
+        )
+        current_value = live_account["account_value"]
+    else:
+        current_value = mission["current_value"] if mission["current_value"] else initial_capital
+
     total_pnl = mission["total_pnl"]
 
     # Sum unrealized from open positions
@@ -226,6 +282,111 @@ async def get_mission_dashboard(
             )
             for t in trades_raw
         ],
+        live_balance=live_balance,
+    )
+
+
+# ==================
+# Activity Feed (AI Reasoning Transparency)
+# ==================
+
+class ActivityEntry(BaseModel):
+    """A single activity entry in the neural feed."""
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    id: str
+    timestamp: datetime
+    node: str
+    action: str
+    activity_type: str  # scan, recall, act, heartbeat
+    asset: Optional[str] = None
+    reasoning: Optional[str] = None
+    decision_summary: Optional[str] = None
+    success: bool = True
+    llm_provider: Optional[str] = None
+
+
+class ActivityFeedResponse(BaseModel):
+    """Neural Activity Feed response."""
+    model_config = ConfigDict(alias_generator=_to_camel, populate_by_name=True)
+
+    mission_id: str
+    activities: List[ActivityEntry]
+    has_more: bool
+
+
+def _map_node_to_activity_type(node: str, action: str) -> str:
+    """Map audit log node/action to mobile ActivityType."""
+    if node == "market_analysis":
+        return "scan"
+    if node == "user_filter":
+        return "recall"
+    if node in ("execution", "trade", "lifecycle"):
+        return "act"
+    return "heartbeat"
+
+
+def _format_node_message(node: str, action: str, asset: Optional[str] = None) -> str:
+    """Human-readable message from audit log node/action."""
+    asset_label = f" on {asset}" if asset else ""
+    mapping = {
+        "market_analysis": f"Market analysis{asset_label}",
+        "user_filter": f"Strategy filter applied{asset_label}",
+        "execution": f"Trade {action.replace('_', ' ')}{asset_label}",
+        "monitoring": f"Risk monitoring check{asset_label}",
+        "lifecycle": f"Mission {action.replace('_', ' ')}",
+    }
+    return mapping.get(node, f"Agent {action.replace('_', ' ')}{asset_label}")
+
+
+@router.get("/missions/{mission_id}/activity", response_model=ActivityFeedResponse)
+async def get_mission_activity(
+    mission_id: str,
+    user: UserInfo = Depends(get_current_user),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """
+    Neural Activity Feed: recent AI decisions and reasoning for a mission.
+    Surfaces audit log data without exposing raw LLM prompts.
+    """
+    from app.services.database import get_mission_by_id, get_audit_logs_by_mission
+
+    mission = await get_mission_by_id(mission_id, user.user_id)
+    if not mission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Mission not found",
+        )
+
+    audit_logs = await get_audit_logs_by_mission(mission_id, limit=limit)
+
+    activities = []
+    for log in audit_logs:
+        activity_type = _map_node_to_activity_type(log["node"], log["action"])
+
+        # Extract decision summary from JSON
+        decision_summary = None
+        if log.get("decision") and isinstance(log["decision"], dict):
+            d = log["decision"]
+            decision_summary = d.get("summary") or d.get("action") or d.get("direction")
+
+        activities.append(ActivityEntry(
+            id=log["id"],
+            timestamp=log["created_at"],
+            node=log["node"],
+            action=log["action"],
+            activity_type=activity_type,
+            asset=log.get("asset"),
+            reasoning=log.get("reasoning"),
+            decision_summary=decision_summary,
+            success=log.get("success", True),
+            llm_provider=log.get("llm_model"),
+        ))
+
+    return ActivityFeedResponse(
+        mission_id=mission_id,
+        activities=activities,
+        has_more=len(audit_logs) >= limit,
     )
 
 

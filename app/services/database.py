@@ -752,6 +752,37 @@ async def record_agent_audit(
         return audit_id
 
 
+async def get_audit_logs_by_mission(
+    mission_id: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch recent audit logs for a mission.
+    Security: excludes llmPrompt and llmResponse — only surfaces reasoning summaries.
+    """
+    async with get_db() as db:
+        query = text("""
+            SELECT
+                a.id,
+                a."missionId" as mission_id,
+                a.node,
+                a.action,
+                a.asset,
+                a.reasoning,
+                a.decision,
+                a."llmModel" as llm_model,
+                a.success,
+                a."errorMessage" as error_message,
+                a."createdAt" as created_at
+            FROM agent_audit_logs a
+            WHERE a."missionId" = :mission_id
+            ORDER BY a."createdAt" DESC
+            LIMIT :limit
+        """)
+        result = await db.execute(query, {"mission_id": mission_id, "limit": limit})
+        return [dict(row._mapping) for row in result.fetchall()]
+
+
 async def save_signal(signal: Dict[str, Any], cycle_id: str) -> str:
     """
     Persist a generated trading signal to the agent_signals table.
